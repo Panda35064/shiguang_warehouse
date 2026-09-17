@@ -745,96 +745,65 @@ async function fjpitWaitForLogin(bar, deadlineTs) {
 }
 
 // ============================================================
-// 十、主流程
+// 十、主流程（编排）
+// ============================================================
+// 遵循官方《学校教务系统适配 · 建议与示例》推荐的编排模式：
+//   · runImportFlow 只按顺序调用下面的函数，不含具体业务代码
+//   · 任一关键步骤取消或失败 → 立即 return，不再往下走
+//   · notifyTaskCompletion() 只在【完全成功】之后调用
+//
+// 另：官方《WebView 页面显示异常的处理》一节明确建议
+//   「放弃从页面 HTML 提取数据，改用 Fetch API 请求接口获取课程数据」
+//   —— 本脚本的通道 A（结构化 API）即遵循此建议。
 // ============================================================
 
-async function runImportFlow() {
-    console.log('JS: 福信智慧教务课表导入开始（v8）');
-
-    if (location.host.indexOf(FJPIT_HOST_KEY) < 0) {
-        fjpitSafeToast('请先在福信智慧教务页面登录后再执行导入。');
-        return;
-    }
-
-    // ---- 0. 修复页面网络通道 ----
-    const repair = fjpitRepairPageNetwork();
-    console.log('JS: 页面网络通道修复 ' + JSON.stringify(repair));
-
-    // ---- 1. 页面可用性修复 ----
-    const vp = await fjpitUnlockViewport();
-    const bar = fjpitBuildControlBar(vp.zoom);
-
-    // ---- 2. 未登录则等待 ----
-    let token = fjpitGetAccessToken();
-    if (!token) {
-        await bar.needLogin();   // 原生弹窗，点掉后继续等登录
-        token = await fjpitWaitForLogin(bar, Date.now() + FJPIT_LOGIN_WAIT_MS);
-        if (!token) {
-            bar.destroy();
-            fjpitSafeToast('未等到登录状态，请登录后重新点「执行导入」。');
-            return;
-        }
-    }
-    bar.setStatus('已登录，准备导入…');
-
-    // ---- 3. 确认 ----
-    const confirmed = await window.shiguangBridgePromise.showAlert(
-        '福信智慧教务课表导入',
-        '已登录教务系统。\n\n本脚本将逐周抓取本学期全部周课表，'
-        + '自动获取开学日期与作息时间，然后导入课表。\n\n'
-        + '视网络情况需要数秒，请勿离开页面。',
-        '开始导入'
-    );
-    if (!confirmed) {
-        bar.destroy();
-        fjpitSafeToast('已取消导入。');
-        return;
-    }
-
-    // ---- 4. 取数：先结构化 API，失败回退 HTML ----
-    let data = null;
-    let channel = '';
+/** 第 1 步：公告式确认（对应官方示例的 promptUserToStart） */
+async function fjpitAskStart() {
     try {
-        data = await fjpitCollectStructured(token, bar);
-        channel = '结构化 API';
+        return await window.shiguangBridgePromise.showAlert(
+            '福信智慧教务课表导入',
+            '本工具将逐周抓取本学期全部周课表，并自动导入开学日期与作息时间。\n\n'
+            + '数据直接读取教务接口，不解析页面，通常几秒完成。\n'
+            + '请勿中途离开页面。',
+            '开始导入'
+        );
+    } catch (e) {
+        console.warn('JS: 确认弹窗失败', e);
+        return false;
+    }
+}
+
+/** 第 2 步：确保已登录；未登录则弹公告引导用户登录并等待 */
+async function fjpitEnsureLogin(bar) {
+    let token = fjpitGetAccessToken();
+    if (token) return token;
+
+    bar.needLogin();
+    token = await fjpitWaitForLogin(bar, Date.now() + FJPIT_LOGIN_WAIT_MS);
+    if (!token) token = fjpitGetAccessToken();   // 兜底：前端可能刚把 token 写进 store
+    return token;
+}
+
+/** 第 3 步：取数 —— 结构化 API 优先，失败整体回退 HTML */
+async function fjpitCollect(token, bar) {
+    try {
+        const data = await fjpitCollectStructured(token, bar);
+        return { data: data, channel: '结构化 API' };
     } catch (eA) {
         console.warn('JS: 结构化通道失败 → 回退 HTML：' + eA.message);
-        try {
-            data = await fjpitCollectHtml(token, bar);
-            channel = 'HTML 解析（回退，原因：' + eA.message + '）';
-        } catch (eB) {
-            bar.destroy();
-            fjpitSafeToast('两种通道均失败：' + eB.message);
-            await window.shiguangBridgePromise.showAlert(
-                '取数失败',
-                '结构化 API 失败：' + eA.message + '\n\nHTML 通道失败：' + eB.message,
-                '知道了'
-            );
-            return;
-        }
+        const data = await fjpitCollectHtml(token, bar);   // 再失败则抛出
+        return { data: data, channel: 'HTML 解析（回退，原因：' + eA.message + '）' };
     }
-    console.log('JS: 使用通道 = ' + channel + '，条目 ' + data.entries.length);
+}
 
-    if (!data.entries.length) {
-        bar.setStatus('未解析到课程');
-        fjpitSafeToast('未取到任何课程，请确认本学期是否有排课。');
-        return;
-    }
-
-    // ---- 5. 聚合 ----
+/** 第 4 步：聚合 + 保存。课程保存失败会抛出（必须中断）；作息与配置尽力而为 */
+async function fjpitSaveAll(data) {
     const courses = fjpitAggregate(data.entries);
     console.log('JS: 原始条目 ' + data.entries.length + '，聚合为 ' + courses.length
         + ' 条课程；开学日期 ' + data.semesterStartDate);
 
-    // ---- 6. 保存 ----
-    bar.setStatus('保存课程…');
-    try {
-        await fjpitSaveCourses(courses);
-    } catch (e) {
-        bar.destroy();
-        fjpitSafeToast('课程保存失败: ' + e.message);
-        return;
-    }
+    await fjpitSaveCourses(courses);
+
     let timeSlotSaved = false;
     try {
         timeSlotSaved = await fjpitSaveTimeSlots(data.timeSlots || []);
@@ -847,8 +816,14 @@ async function runImportFlow() {
         console.warn('JS: 课表配置保存失败: ' + e.message);
     }
 
-    // ---- 7. 汇总 ----
-    // 统计（便于核对数据是否正确）
+    return { courses: courses, timeSlotSaved: timeSlotSaved };
+}
+
+/** 第 5 步：汇总公告 + 尽力导出调试数据 */
+async function fjpitReport(got, saved) {
+    const data = got.data;
+    const courses = saved.courses;
+
     const nameSet = {};
     let emptyPos = 0, emptyTea = 0;
     courses.forEach(function (c) {
@@ -858,10 +833,10 @@ async function runImportFlow() {
     });
     const nameCount = Object.keys(nameSet).length;
 
-    // 尽力导出一份完整调试数据（部分 WebView 不支持下载，失败无妨）
+    // 调试导出：部分 WebView 不支持 <a download>，失败不影响流程
     try {
         const payload = {
-            channel: channel,
+            channel: got.channel,
             generatedAt: new Date().toISOString(),
             semesterStartDate: data.semesterStartDate,
             totalWeeks: data.totalWeeks,
@@ -886,20 +861,95 @@ async function runImportFlow() {
 
     const summary = [
         '导入完成',
-        '取数通道：' + channel,
+        '取数通道：' + got.channel,
         '课程行数：' + courses.length + '（' + nameCount + ' 门课）',
         '原始条目：' + data.entries.length + ' 条',
         '学期周数：' + data.totalWeeks,
         '开学日期：' + (data.semesterStartDate || '未取到'),
-        '作息时间：' + (timeSlotSaved ? (data.timeSlots || []).length + ' 节' : '未导入'),
+        '作息时间：' + (saved.timeSlotSaved ? (data.timeSlots || []).length + ' 节' : '未导入'),
         '空教师 ' + emptyTea + ' 行 / 空教室 ' + emptyPos + ' 行',
         (data.failedWeeks && data.failedWeeks.length)
             ? '失败周次：' + data.failedWeeks.join(',') : '全部周次抓取成功'
     ];
     console.log('JS: ' + summary.join(' | '));
-    bar.destroy();
+
     await window.shiguangBridgePromise.showAlert('导入完成', summary.join('\n'), '好的');
     fjpitSafeToast('导入成功，共 ' + courses.length + ' 条课程');
+}
+
+/**
+ * 编排入口：只做流程编排，具体业务都在上面的函数里。
+ * 任一关键步骤失败或用户取消 → 立即 return（不会调用 notifyTaskCompletion）。
+ */
+async function runImportFlow() {
+    console.log('JS: 福信智慧教务课表导入开始（v11）');
+
+    // 0. 环境准备
+    if (location.host.indexOf(FJPIT_HOST_KEY) < 0) {
+        fjpitSafeToast('请先在福信智慧教务页面登录后再执行导入。');
+        return;
+    }
+    const repair = fjpitRepairPageNetwork();
+    console.log('JS: 页面网络通道修复 ' + JSON.stringify(repair));
+
+    const vp = await fjpitUnlockViewport();
+    const bar = fjpitBuildControlBar(vp.zoom);
+
+    // 1. 登录（未登录则弹公告引导 + 等待）
+    const token = await fjpitEnsureLogin(bar);
+    if (!token) {
+        bar.destroy();
+        fjpitSafeToast('未等到登录状态，请登录后重新点「执行导入」。');
+        return;
+    }
+    bar.setStatus('已登录，准备导入…');
+
+    // 2. 确认
+    const confirmed = await fjpitAskStart();
+    if (!confirmed) {
+        bar.destroy();
+        fjpitSafeToast('已取消导入。');
+        return;
+    }
+
+    // 3. 取数
+    let got;
+    try {
+        got = await fjpitCollect(token, bar);
+    } catch (e) {
+        bar.destroy();
+        fjpitSafeToast('取数失败：' + e.message);
+        await window.shiguangBridgePromise.showAlert(
+            '取数失败',
+            '两种通道均未能取到数据：\n' + e.message
+            + '\n\n请确认已登录教务系统后重试。',
+            '知道了'
+        );
+        return;
+    }
+    if (!got.data.entries.length) {
+        bar.setStatus('未取到课程');
+        bar.destroy();
+        fjpitSafeToast('未取到任何课程，请确认本学期是否有排课。');
+        return;
+    }
+
+    // 4. 聚合 + 保存
+    bar.setStatus('保存课程…');
+    let saved;
+    try {
+        saved = await fjpitSaveAll(got.data);
+    } catch (e) {
+        bar.destroy();
+        fjpitSafeToast('课程保存失败：' + e.message);
+        return;
+    }
+
+    // 5. 汇总
+    bar.destroy();
+    await fjpitReport(got, saved);
+
+    // 6. 完全成功，才发结束信号
     window.shiguangBridge.notifyTaskCompletion();
 }
 
