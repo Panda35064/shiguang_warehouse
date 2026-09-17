@@ -1,48 +1,51 @@
 // ============================================================
-// 福建信息职业技术学院 · 福信智慧教务 → 拾光课程表 适配脚本  v8
+// 福建信息职业技术学院 · 福信智慧教务 → 拾光课程表 适配脚本
 // ============================================================
 // 教务前端: https://jw.fjpit.com   (Vue3 + Vben Admin 5.5.6, 超星系)
 // 教务接口: https://jw-api.fjpit.com/api
 //
 // ============================================================
-// ★ 双通道取数
+// ★ 取数：直接读教务接口，不解析页面 HTML
 // ============================================================
-// 通道 A（优先）：结构化 API —— 返回 JSON，完全不需要解析 HTML
+// 这套接口来自移动端 m.fjpit.com（与主站共用同一后端与同一鉴权），
+// 返回结构化 JSON，因此不需要做 rowspan/colspan 网格重建，
+// 开学日期、总周数、作息时间也都能直接拿到，无需从页面里抠。
+//
 //   GET  /semesters                        → {semesters:[{label,value,isCurrent,isXxq}]}
 //   POST /semesterConfig {semester}        → {semestersConfig:{startDate,totalWeeks,xxqStartDate,...}}
 //   POST /scheduleTime   {dqz}             → {<key>:{jcdm,jcmc,jcskkssj,jcskjssj,remark}}
 //   POST /schedule {semester,week,showxxq} → {list:[{course,teacherName,spaceName,
 //                                              DayIndex,startNode,endNode,mergeTaskId,...}]}
 //   鉴权：请求头 ba-token + server: 1
-//   （这套接口来自移动端 m.fjpit.com，与主站共用同一后端与同一鉴权）
 //
-// 通道 B（回退）：逐周 POST /student/scheduleTable → HTML 表格 → 网格重建
-//   鉴权：请求头 ba-token + is-main
-//
-// 通道 A 任一步抛错就整体回退到通道 B，并在汇总里注明实际使用的通道。
+// 官方文档《WebView 页面显示异常的处理》也建议
+// 「放弃从页面 HTML 提取数据，改用 Fetch API 请求接口获取课程数据」。
 //
 // ============================================================
-// ★ X-WebView-Post-Id 是 WAF 的触发点（v7 已修）
+// ★ X-WebView-Post-Id 是 WAF 的触发点
 // ============================================================
 // App 注入的 JS_INTERCEPT_POST 会给每个带字符串 body 的非 GET 请求
 // 自动加该头，而教务 WAF 直接拒绝带它的请求（fetch 抛 Failed to fetch、耗时极短）。
 // 诊断 v6 铁证：同一接口同一 frame，body 为字符串→FAIL、为 Blob→OK 200。
 //
+// 「电脑模式」救不了它：App 的拦截器要求 requestId != null，
+// 而那个 id 恰恰只能靠这个头传递 —— 可这个头本身就是毒药。
+//
 // 因此本脚本：
-//   1. 修复页面自身网络通道（让用户能正常登录）
+//   1. 修复页面自身网络通道（让用户能正常登录，否则连登录都发不出去）
 //      · window.fetch → 子 frame 的原生实现
 //      · XHR 的 setRequestHeader 包一层丢弃该头（走原型链）
 //   2. 自身所有请求走同一干净通道
 //   （App 的 evaluateJavascript 只注入主 frame，子 frame 是干净的）
 //
 // ------------------------------------------------------------
-// 与官方案例（如 NEUQ 树维教务）的关键差异
+// 与官方案例（如 NEUQ / YANGTZEU 树维教务）的关键差异
 // ------------------------------------------------------------
-// NEUQ 等案例的做法是「用户先在页面里登录好 → 点执行导入 → 直接 fetch」，
-// 因为它们的问题只是「页面显示异常」，登录 Cookie 本身是完整的。
+// 它们的做法是「用户先在页面里登录好 → 点执行导入 → 直接 fetch」，
+// 因为登录发生在独立的 CAS 域名上，绕开了教务系统的 WAF
+// （长江大学的 import_url 就直接指向 CAS 认证页）。
 //
-// 福信不同：教务 WAF 会拦掉带 X-WebView-Post-Id 的请求，
-// **登录 POST 本身就在被拦之列**（诊断 v6：主 frame POST 全 FAIL、
+// 福信不同：登录 POST 就在被 WAF 拦的域名上（诊断 v6：主 frame POST 全 FAIL、
 // 去掉该头的请求全部 200）。所以「先登录」在未加工前走不通，
 // 必须先运行本脚本把请求通道理通 —— 这是学校侧的限制，不是适配设计绕弯。
 //
@@ -71,27 +74,12 @@ function fjpitUuid() {
     try { return crypto.randomUUID(); } catch (e) { return 'p-' + Date.now() + '-' + Math.random().toString(36).slice(2); }
 }
 
-function fjpitStripTags(s) {
-    return String(s == null ? '' : s).replace(/<[^>]+>/g, ' ');
-}
-
-function fjpitNormText(s) {
-    return fjpitStripTags(s).replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
-function fjpitAttrInt(attrs, name) {
-    const m = new RegExp(name + '\\s*=\\s*"?\\d+"?', 'i').exec(attrs || '');
-    if (!m) return 1;
-    const n = /(\d+)/.exec(m[0]);
-    return n ? parseInt(n[1], 10) : 1;
-}
-
 /**
  * 把日期对齐到「所在周的周一」，返回 YYYY-MM-DD。
  *
  * 为什么需要：移动端前端就是这么算的（`const u = s===0 ? -6 : 1-s; l.setDate(l.getDate()+u)`），
  * 说明教务给的 startDate 不一定是周一。实测该校的 startDate = 2026-09-09（周三），
- * 而第 1 周周一应是 2026-09-07 —— 与 HTML 通道解析出的表头日期完全吻合。
+ * 而第 1 周周一应是 2026-09-07（该日期另经教务页面表头与移动端算法两处印证）。
  *
  * 用 UTC 运算避免设备时区把日期挪走一天。
  */
@@ -385,19 +373,6 @@ function fjpitGetAccessToken() {
     return fallback;
 }
 
-/** 通道 B（HTML）用的头 */
-function fjpitHeaders(token) {
-    const h = {
-        'Accept': 'application/json, text/plain, */*',
-        'Content-Type': 'application/json;charset=UTF-8',
-        'is-main': 'true',
-        'unique-request-id': fjpitUuid(),
-        'Accept-Language': 'zh-CN,zh;q=0.9'
-    };
-    if (token) h['ba-token'] = token;
-    return h;
-}
-
 /** 通道 A（结构化 API）用的头 —— 与移动端 m.fjpit.com 一致 */
 function fjpitApiHeaders(token) {
     const h = {
@@ -412,7 +387,7 @@ function fjpitApiHeaders(token) {
 }
 
 // ============================================================
-// 四、通道 A：结构化 API
+// 四、取数（结构化 API）
 // ============================================================
 
 async function fjpitApiGet(path, token) {
@@ -441,7 +416,7 @@ async function fjpitApiPost(path, body, token) {
  * 任一步失败直接抛错，由调用方回退 HTML 通道。
  * 返回 { entries, timeSlots, semesterStartDate, totalWeeks, meta }
  */
-async function fjpitCollectStructured(token, bar) {
+async function fjpitCollectData(token, bar) {
     // 1) 学期列表
     bar.setStatus('读取学期列表…');
     const semData = await fjpitApiGet('/semesters', token);
@@ -514,178 +489,7 @@ async function fjpitCollectStructured(token, bar) {
 }
 
 // ============================================================
-// 五、通道 B：HTML（回退）
-// ============================================================
-
-async function fjpitGetWeekList(token) {
-    const resp = await fjpitFetch(FJPIT_API + '/student/week', {
-        method: 'GET', headers: fjpitHeaders(token), credentials: 'omit', mode: 'cors'
-    });
-    if (!resp.ok) throw new Error('获取周次失败，HTTP ' + resp.status);
-    const json = await resp.json();
-    if (json.code !== 1) throw new Error('获取周次失败: ' + (json.msg || '未知错误'));
-    const data = json.data || {};
-    const list = Array.isArray(data.weekList) ? data.weekList : [];
-    return { currentWeek: data.dqz, totalWeeks: list.length || 20 };
-}
-
-async function fjpitGetWeekHtml(token, week) {
-    const resp = await fjpitFetch(FJPIT_API + '/student/scheduleTable', {
-        method: 'POST', headers: fjpitHeaders(token), credentials: 'omit', mode: 'cors',
-        body: JSON.stringify({ dqz: week })
-    });
-    if (!resp.ok) throw new Error('第 ' + week + ' 周请求失败，HTTP ' + resp.status);
-    const json = await resp.json();
-    if (json.code !== 1) throw new Error('第 ' + week + ' 周返回异常: ' + (json.msg || '未知错误'));
-    return typeof json.data === 'string' ? json.data : '';
-}
-
-async function fjpitCollectHtml(token, bar) {
-    bar.setStatus('获取周次…');
-    const weekInfo = await fjpitGetWeekList(token);
-    const totalWeeks = weekInfo.totalWeeks;
-    console.log('JS[B]: 总周数 ' + totalWeeks + '，当前周 ' + weekInfo.currentWeek);
-
-    const entries = [];
-    let timeSlots = [];
-    let semesterStartDate = '';
-    const failedWeeks = [];
-
-    for (let w = 1; w <= totalWeeks; w++) {
-        bar.setStatus('抓取第 ' + w + '/' + totalWeeks + ' 周…');
-        let html = '';
-        try {
-            html = await fjpitGetWeekHtml(token, w);
-        } catch (e) {
-            console.warn('JS[B]: 第 ' + w + ' 周抓取失败: ' + e.message);
-            failedWeeks.push(w);
-            continue;
-        }
-        const parsed = fjpitParseWeek(html, w);
-        entries.push.apply(entries, parsed.entries);
-        if (w === 1) {
-            timeSlots = parsed.timeSlots;
-            semesterStartDate = parsed.mondayDate;
-        }
-    }
-
-    return {
-        entries: entries, timeSlots: timeSlots,
-        semesterStartDate: semesterStartDate, totalWeeks: totalWeeks,
-        failedWeeks: failedWeeks, meta: {}
-    };
-}
-
-// ============================================================
-// 六、HTML 解析
-// ============================================================
-
-function fjpitCellPayload(content) {
-    if (!content) return null;
-    const m = /title\s*=\s*(["'])([\s\S]*?)\1/.exec(content);
-    if (m) {
-        const parts = m[2].split(/[\r\n]+|\\n/).map(function (s) { return s.trim(); });
-        while (parts.length < 3) parts.push('');
-        if (parts[0]) return { name: parts[0], teacher: parts[1], room: parts[2] };
-    }
-    const divs = content.match(/<div[^>]*>([\s\S]*?)<\/div>/g);
-    if (divs && divs.length >= 3) {
-        const get = function (i) {
-            return fjpitNormText(divs[i].replace(/^<div[^>]*>/, '').replace(/<\/div>$/, ''));
-        };
-        const name = get(0), teacher = get(1), room = get(2);
-        if (name) return { name: name, teacher: teacher, room: room };
-    }
-    return null;
-}
-
-function fjpitParseWeek(html, week) {
-    const out = { entries: [], timeSlots: [], mondayDate: '' };
-    if (!html) return out;
-
-    const rowHtmls = html.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
-    const grid = new Map();
-    const occupied = new Set();
-
-    rowHtmls.forEach(function (tr, r) {
-        const tds = [];
-        const re = /<td([^>]*)>([\s\S]*?)<\/td>/gi;
-        let m;
-        while ((m = re.exec(tr)) !== null) tds.push({ attrs: m[1], content: m[2] });
-
-        let c = 0;
-        tds.forEach(function (td) {
-            while (occupied.has(r + ',' + c)) c += 1;   // 跳过上方 rowspan 占位
-            const rs = fjpitAttrInt(td.attrs, 'rowspan');
-            const cs = fjpitAttrInt(td.attrs, 'colspan');
-            for (let dr = 0; dr < rs; dr++) {
-                for (let dc = 0; dc < cs; dc++) {
-                    occupied.add((r + dr) + ',' + (c + dc));
-                    grid.set((r + dr) + ',' + (c + dc), {
-                        content: td.content, rowspan: rs, colspan: cs,
-                        primary: (dr === 0 && dc === 0)
-                    });
-                }
-            }
-            c += cs;
-        });
-    });
-
-    const lastRow = rowHtmls.length - 1;
-
-    const days = {};
-    for (let c = 1; c <= lastRow; c++) {
-        const cell = grid.get('0,' + c);
-        if (!cell) continue;
-        const txt = fjpitStripTags(cell.content);
-        const dm = /(\d{4}-\d{2}-\d{2})/.exec(txt);
-        const nm = /(星期[一二三四五六日天])/.exec(txt);
-        days[c] = { date: dm ? dm[1] : '', name: nm ? nm[1] : '' };
-    }
-    out.mondayDate = (days[1] && days[1].date) || '';
-
-    const rowPeriod = {};
-    for (let r = 1; r <= lastRow; r++) {
-        const cell = grid.get(r + ',0');
-        if (!cell) continue;
-        const txt = fjpitNormText(cell.content);
-        const pm = /第\s*(\d+)\s*节/.exec(txt);
-        const tm = /(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})/.exec(txt);
-        if (pm) rowPeriod[r] = parseInt(pm[1], 10);
-        if (pm && tm && out.timeSlots.length < 32) {
-            out.timeSlots.push({ number: parseInt(pm[1], 10), startTime: tm[1], endTime: tm[2] });
-        }
-    }
-
-    for (let r = 1; r <= lastRow; r++) {
-        if (rowPeriod[r] === undefined) continue;   // 中午1/中午2 等非节次行
-        for (let c = 1; c <= lastRow; c++) {
-            const cell = grid.get(r + ',' + c);
-            if (!cell || !cell.primary) continue;
-            const payload = fjpitCellPayload(cell.content);
-            if (!payload) continue;
-
-            const covered = [];
-            for (let rr = r; rr < r + cell.rowspan; rr++) {
-                if (rowPeriod[rr] !== undefined) covered.push(rowPeriod[rr]);
-            }
-            if (!covered.length) covered.push(rowPeriod[r]);
-            const start = Math.min.apply(null, covered);
-            const end = Math.max.apply(null, covered);
-
-            const d = days[c] || {};
-            out.entries.push({
-                week: week, day: c, date: d.date || '',
-                start: start, end: end,
-                name: payload.name, teacher: payload.teacher, room: payload.room
-            });
-        }
-    }
-    return out;
-}
-
-// ============================================================
-// 七、聚合（教师/教室原样透传）
+// 五、聚合（教师/教室原样透传）
 // ============================================================
 
 function fjpitAggregate(entries) {
@@ -716,7 +520,7 @@ function fjpitAggregate(entries) {
 }
 
 // ============================================================
-// 八、保存
+// 六、保存
 // ============================================================
 
 async function fjpitSaveCourses(courses) {
@@ -740,7 +544,7 @@ async function fjpitSaveConfig(semesterStartDate, totalWeeks) {
 }
 
 // ============================================================
-// 九、等待登录
+// 七、等待登录
 // ============================================================
 
 async function fjpitWaitForLogin(bar, deadlineTs) {
@@ -761,7 +565,7 @@ async function fjpitWaitForLogin(bar, deadlineTs) {
 }
 
 // ============================================================
-// 十、主流程（编排）
+// 八、主流程（编排）
 // ============================================================
 // 遵循官方《学校教务系统适配 · 建议与示例》推荐的编排模式：
 //   · runImportFlow 只按顺序调用下面的函数，不含具体业务代码
@@ -800,18 +604,6 @@ async function fjpitEnsureLogin(bar) {
     return token;
 }
 
-/** 第 3 步：取数 —— 结构化 API 优先，失败整体回退 HTML */
-async function fjpitCollect(token, bar) {
-    try {
-        const data = await fjpitCollectStructured(token, bar);
-        return { data: data, channel: '结构化 API' };
-    } catch (eA) {
-        console.warn('JS: 结构化通道失败 → 回退 HTML：' + eA.message);
-        const data = await fjpitCollectHtml(token, bar);   // 再失败则抛出
-        return { data: data, channel: 'HTML 解析（回退，原因：' + eA.message + '）' };
-    }
-}
-
 /** 第 4 步：聚合 + 保存。课程保存失败会抛出（必须中断）；作息与配置尽力而为 */
 async function fjpitSaveAll(data) {
     const courses = fjpitAggregate(data.entries);
@@ -836,8 +628,7 @@ async function fjpitSaveAll(data) {
 }
 
 /** 第 5 步：汇总公告 + 尽力导出调试数据 */
-async function fjpitReport(got, saved) {
-    const data = got.data;
+async function fjpitReport(data, saved) {
     const courses = saved.courses;
 
     const nameSet = {};
@@ -852,7 +643,6 @@ async function fjpitReport(got, saved) {
     // 调试导出：部分 WebView 不支持 <a download>，失败不影响流程
     try {
         const payload = {
-            channel: got.channel,
             generatedAt: new Date().toISOString(),
             semesterStartDate: data.semesterStartDate,
             totalWeeks: data.totalWeeks,
@@ -877,7 +667,6 @@ async function fjpitReport(got, saved) {
 
     const summary = [
         '导入完成',
-        '取数通道：' + got.channel,
         '课程行数：' + courses.length + '（' + nameCount + ' 门课）',
         '原始条目：' + data.entries.length + ' 条',
         '学期周数：' + data.totalWeeks,
@@ -928,22 +717,22 @@ async function runImportFlow() {
         return;
     }
 
-    // 3. 取数
-    let got;
+    // 3. 取数（全部走教务接口，不解析页面 HTML）
+    let data;
     try {
-        got = await fjpitCollect(token, bar);
+        data = await fjpitCollectData(token, bar);
     } catch (e) {
         bar.destroy();
         fjpitSafeToast('取数失败：' + e.message);
         await window.shiguangBridgePromise.showAlert(
             '取数失败',
-            '两种通道均未能取到数据：\n' + e.message
+            '未能取到课表数据：\n' + e.message
             + '\n\n请确认已登录教务系统后重试。',
             '知道了'
         );
         return;
     }
-    if (!got.data.entries.length) {
+    if (!data.entries.length) {
         bar.setStatus('未取到课程');
         bar.destroy();
         fjpitSafeToast('未取到任何课程，请确认本学期是否有排课。');
@@ -954,7 +743,7 @@ async function runImportFlow() {
     bar.setStatus('保存课程…');
     let saved;
     try {
-        saved = await fjpitSaveAll(got.data);
+        saved = await fjpitSaveAll(data);
     } catch (e) {
         bar.destroy();
         fjpitSafeToast('课程保存失败：' + e.message);
@@ -963,7 +752,7 @@ async function runImportFlow() {
 
     // 5. 汇总
     bar.destroy();
-    await fjpitReport(got, saved);
+    await fjpitReport(data, saved);
 
     // 6. 完全成功，才发结束信号
     window.shiguangBridge.notifyTaskCompletion();
