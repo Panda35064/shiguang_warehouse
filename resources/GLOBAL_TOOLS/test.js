@@ -631,14 +631,16 @@ async function fjpitDiagSend(fetcher, path, opts) {
     }
 }
 
-function fjpitDiagXhr(url, body) {
+function fjpitDiagXhr(XHRClass, url, headers, body) {
     return new Promise(function (resolve) {
         const t0 = Date.now();
         try {
-            const x = new XMLHttpRequest();
+            const x = new XHRClass();
             x.open('POST', url, true);
-            x.setRequestHeader('Content-Type', 'application/json;charset=UTF-8');
-            x.setRequestHeader('server', '1');
+            const hs = headers || { 'Content-Type': 'application/json;charset=UTF-8', 'server': '1' };
+            for (const k in hs) {
+                if (Object.prototype.hasOwnProperty.call(hs, k)) x.setRequestHeader(k, hs[k]);
+            }
             x.onload = function () {
                 resolve({
                     status: String(x.status), ok: x.status >= 200 && x.status < 300,
@@ -750,8 +752,15 @@ async function runDiagFlow() {
         return fjpitDiagSend(clean, '/scheduleTime',
             { method: 'POST', headers: apiHeaders, body: JSON.stringify({ dqz: 1 }) });
     });
-    await probe('B3 子frame 干净 XHR POST', function () {
-        return fjpitDiagXhr(FJPIT_API + '/scheduleTime', JSON.stringify({ dqz: 1 }));
+    await probe('B3 主frame XHR（仅原型hook）', function () {
+        return fjpitDiagXhr(window.XMLHttpRequest, FJPIT_API + '/scheduleTime', apiHeaders,
+            JSON.stringify({ dqz: 1 }));
+    });
+    await probe('B4 子frame 原生 XHR 类', function () {
+        let XC = null;
+        try { XC = fjpitCleanWindow().XMLHttpRequest; } catch (e) {}
+        if (!XC) return { status: 'ERR', ok: false, body: '', err: '拿不到子 frame 的 XMLHttpRequest' };
+        return fjpitDiagXhr(XC, FJPIT_API + '/scheduleTime', apiHeaders, JSON.stringify({ dqz: 1 }));
     });
 
     // ---------- C. 取数接口逐项 ----------
@@ -823,7 +832,7 @@ async function runDiagFlow() {
         }
         return null;
     };
-    const a1 = get('A1'), a2 = get('A2'), b2 = get('B2'), b3 = get('B3');
+    const a1 = get('A1'), a2 = get('A2'), b2 = get('B2'), b3 = get('B3'), b4 = get('B4');
     const cList = [get('C1'), get('C2'), get('C3'), get('C4')];
     const v = [];
 
@@ -844,10 +853,25 @@ async function runDiagFlow() {
         }
     }
 
-    if (b2 && b3) {
-        if (b2.ok && b3.ok) v.push('★ 子 frame 干净通道（fetch/XHR）均正常 ✓');
-        else if (!b2.ok && !b3.ok) v.push('★★ 干净通道也失效 → 修复方案需重做');
-        else v.push('★ 干净通道部分失效（fetch ' + (b2.ok ? '通' : '挂') + ' / XHR ' + (b3.ok ? '通' : '挂') + '）');
+    if (b2 && b4) {
+        if (b2.ok && b4.ok) {
+            v.push('★ 干净通道正常：子 frame fetch 通 / 子 frame XHR 通 ✓');
+        } else if (!b2.ok && !b4.ok) {
+            v.push('★★ 干净通道也失效 → 修复方案需重做');
+        } else {
+            v.push('★ 干净通道部分失效：子 frame fetch ' + (b2.ok ? '通' : '挂')
+                + ' / 子 frame XHR ' + (b4.ok ? '通' : '挂'));
+        }
+    }
+
+    if (b3) {
+        if (b3.ok) {
+            v.push('★ 主 frame XHR（仅靠原型 hook 丢头）可通');
+        } else {
+            v.push('★★ 主 frame XHR 仍被拦（仅靠 setRequestHeader 原型 hook 无效）');
+            v.push('  ⇒ App 的 XHR 补丁绕过了原型 hook（多半在 send 内部用了原始引用）');
+            v.push('  ⇒ 页面登录走 axios→XHR，因此会失败；需整体替换 window.XMLHttpRequest');
+        }
     }
 
     const okC = cList.filter(function (x) { return x && x.ok; });
@@ -897,9 +921,26 @@ async function runDiagFlow() {
         try { layer.parentNode.removeChild(layer); } catch (e) {}
     });
 
+    // 弹窗内容：结论 + 紧凑明细 + 关键返回（一次可见，不必依赖浮层）
+    const compact = D.items.map(function (it) { return fjpitDiagLine(it); });
+    const keyReturns = D.items.filter(function (it) {
+        const n = it.name.charAt(0);
+        return n === 'B' || n === 'C' || n === 'E';
+    }).map(function (it) {
+        return '· ' + it.name + ' → '
+            + (it.body ? it.body.slice(0, 96) : (it.err || '(无)'));
+    });
+
+    const alertBody = v
+        .concat(['', '=== 明细 ==='])
+        .concat(compact)
+        .concat(['', '=== 关键返回（截断 96 字）==='])
+        .concat(keyReturns)
+        .concat(['', '（上面可滚动；完整明细另见页面浮层）'])
+        .join('\n');
+
     try {
-        await window.shiguangBridgePromise.showAlert(
-            '体检结果', v.join('\n') + '\n\n（明细见页面上方浮层）', '知道了');
+        await window.shiguangBridgePromise.showAlert('体检结果', alertBody, '知道了');
     } catch (e) {
         console.warn('JS: 体检弹窗失败', e);
     }
