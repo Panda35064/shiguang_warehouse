@@ -1,21 +1,22 @@
 // ============================================================
-// 福信教务 · App 内 WebView 诊断 v2（临时，非适配代码）
+// 福信教务 · App 内 WebView 诊断 v3（临时，非适配代码）
 // ============================================================
-// v1 结论：GET（含自定义头 + CORS 预检）→ HTTP 200；
-//          POST scheduleTable → 53ms 内 TypeError: Failed to fetch
-//          → 不是超时，是请求被提前拒绝。
+// 背景：v2 已确认 —— 教务服务端拒 POST（第三方 POST 正常），
+//       且 WebView 自动加了 X-Requested-With = App 包名。
+//       代理已排除（全程未开代理 + 校园网），SSO 回跳也被拒。
 //
-// v2 目的：
-//   1) 把 POST 按「请求头组合」逐一拆开，定位是哪个头触发拒绝
-//   2) 用第三方域名的 POST 做对照，区分「WebView 拦 POST」还是「教务服务端拦 POST」
-//   3) 回显请求头，确认 WebView 到底带了哪些指纹头
-// 结论放最前面，避免被弹窗截断。
+// 本版要回答的两个问题：
+//   Q1  WAF 是不是因为 POST 的 X-Requested-With 不是 XMLHttpRequest 而拦截？
+//   Q2  JS 能不能覆盖 WebView 自动加的那个值？（能覆盖 ⇒ 适配脚本可自救）
+//
+// 结论放最前面。
 // ============================================================
 
 (function () {
     'use strict';
 
     const API = 'https://jw-api.fjpit.com/api';
+    const P = API + '/student/scheduleTable';
     const TIMEOUT = 10000;
     const BODY = JSON.stringify({ dqz: 1 });
 
@@ -50,52 +51,69 @@
     async function run() {
         const R = {};
 
-        // ---- GET 基准 ----
-        R.getPlain = await probe('GET 无头', API + '/student/week',
-            { method: 'GET', mode: 'cors', credentials: 'omit' });
-        R.getHdr = await probe('GET +ba-token', API + '/student/week',
-            { method: 'GET', mode: 'cors', credentials: 'omit', headers: { 'ba-token': 'x', 'is-main': 'true' } });
-
-        // ---- POST 变体：逐个头往上加 ----
-        const P = API + '/student/scheduleTable';
-        R.postBare = await probe('POST 无任何头', P,
+        // 基准：v2 里失败的那个
+        R.bare = await probe('POST 裸', P,
             { method: 'POST', mode: 'cors', credentials: 'omit', body: BODY });
-        R.postText = await probe('POST +text/plain', P,
-            { method: 'POST', mode: 'cors', credentials: 'omit', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: BODY });
-        R.postJson = await probe('POST +json头', P,
-            { method: 'POST', mode: 'cors', credentials: 'omit', headers: { 'Content-Type': 'application/json;charset=UTF-8' }, body: BODY });
-        R.postTok = await probe('POST +ba-token', P,
-            { method: 'POST', mode: 'cors', credentials: 'omit', headers: { 'ba-token': 'x', 'is-main': 'true' }, body: BODY });
-        R.postFull = await probe('POST +ba-token+json', P,
-            { method: 'POST', mode: 'cors', credentials: 'omit', headers: { 'ba-token': 'x', 'is-main': 'true', 'Content-Type': 'application/json;charset=UTF-8' }, body: BODY });
 
-        // ---- 对照组：第三方域名的 POST（区分 WebView vs 教务服务端）----
-        R.postThird = await probe('POST httpbin(第三方)', 'https://httpbin.org/post',
-            { method: 'POST', mode: 'cors', headers: { 'Content-Type': 'application/json' }, body: BODY });
+        // ★ 核心实验：显式把 X-Requested-With 设成 XMLHttpRequest
+        R.xrwOnly = await probe('POST +XRW:XMLHttpRequest', P,
+            { method: 'POST', mode: 'cors', credentials: 'omit',
+              headers: { 'X-Requested-With': 'XMLHttpRequest' }, body: BODY });
 
-        // ---- 另一台主机 ----
-        R.wx = await probe('GET wx.fjpit.com', 'https://wx.fjpit.com/',
+        // ★ 真实形态的修正版：XRW + ba-token + is-main + json
+        R.xrwFull = await probe('POST +XRW+ba-token+json', P,
+            { method: 'POST', mode: 'cors', credentials: 'omit',
+              headers: {
+                  'X-Requested-With': 'XMLHttpRequest',
+                  'ba-token': 'x', 'is-main': 'true',
+                  'Content-Type': 'application/json;charset=UTF-8'
+              },
+              body: BODY });
+
+        // 对照：无需鉴权的 POST 端点（看是不是「受保护端点」才被拦）
+        R.logout = await probe('POST /auth/logout', API + '/auth/logout',
+            { method: 'POST', mode: 'cors', credentials: 'omit',
+              headers: { 'Content-Type': 'application/json;charset=UTF-8' }, body: '{}' });
+
+        // 对照：POST 到一个不存在的路径 —— 区分「整域名拦 POST」还是「只有这个端点」
+        R.nxPath = await probe('POST 不存在路径', API + '/__diag_probe__',
+            { method: 'POST', mode: 'cors', credentials: 'omit', body: BODY });
+
+        // 对照：同一路径的 GET（v2 只测了 /student/week）
+        R.getSched = await probe('GET scheduleTable', P,
             { method: 'GET', mode: 'cors', credentials: 'omit' });
 
-        // ---- 请求头回显 ----
-        R.echo = await probe('头回显 httpbin', 'https://httpbin.org/headers', { method: 'GET', mode: 'cors' });
+        // Q2：JS 设的 XRW 能不能压过 WebView 自动加的那个？用第三方回显看
+        R.echo = await probe('POST httpbin +XRW', 'https://httpbin.org/post',
+            { method: 'POST', mode: 'cors',
+              headers: { 'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/json' },
+              body: BODY });
 
         // ---------- 判定 ----------
         const v = [];
-        if (R.postThird.ok && !R.postBare.ok) {
-            v.push('★ 第三方 POST 通、教务 POST 不通');
-            v.push('  → 不是 WebView 的问题，是教务服务端拦 POST');
-        } else if (!R.postThird.ok && !R.postBare.ok) {
-            v.push('★ 连第三方 POST 都失败 → WebView 层面拦了 POST');
-        } else if (R.postBare.ok) {
-            v.push('POST 最简形态可通，逐个加头定位：');
-            if (!R.postText.ok) v.push('  → 加 text/plain 就挂');
-            else if (!R.postJson.ok) v.push('  → 只有 application/json 挂（服务端允许头不含 content-type）');
-            else if (!R.postTok.ok) v.push('  → 加 ba-token 就挂（自定义头预检被拒）');
-            else if (!R.postFull.ok) v.push('  → 组合头挂');
-            else v.push('  → 全通，与 v1 矛盾，需复测');
+        if (R.xrwOnly.ok || R.xrwFull.ok) {
+            v.push('★★ 加上 X-Requested-With: XMLHttpRequest 后 POST 通了！');
+            v.push('   → WAF 就是按这个头拦的，适配脚本可以自救');
+        } else if (R.bare.ok) {
+            v.push('裸 POST 也通了（与 v2 不一致，可能环境有变）');
+        } else if (R.logout.ok || R.nxPath.ok) {
+            v.push('★ 其他 POST 端点通、只有 scheduleTable 不通');
+            v.push('   → POST 没被整体拦，是该端点/未登录状态的问题');
+        } else if (!R.getSched.ok) {
+            v.push('★ 同路径 GET 也挂 → 罕见，需复测');
+        } else {
+            v.push('★ 加 XRW 也无效，且该域名下所有 POST 都挂');
+            v.push('   → 整个 jw-api 域名拒绝来自本 WebView 的 POST，单靠改头解决不了');
         }
-        if (R.getHdr.ok && !R.postBare.ok) v.push('  （GET 带自定义头通 → 预检机制本身正常，问题在 POST）');
+
+        // 回显解析：看最终 XRW 到底是什么 / 有没有重复
+        let xrwEcho = '(未取到)';
+        try {
+            const j = JSON.parse(R.echo.text);
+            const h = (j && j.headers) || {};
+            const keys = Object.keys(h).filter(function (k) { return k.toLowerCase() === 'x-requested-with'; });
+            xrwEcho = keys.length ? (keys.map(function (k) { return h[k]; }).join(' | ')) : '(响应里没有 X-Requested-With)';
+        } catch (e) { xrwEcho = '(httpbin 响应解析失败)'; }
 
         // ---------- 输出 ----------
         const out = [];
@@ -103,48 +121,25 @@
         v.forEach(function (x) { out.push(x); });
         out.push('');
         out.push('=== 明细 ===');
-        out.push('GET  无头               ' + line(R.getPlain));
-        out.push('GET  +ba-token          ' + line(R.getHdr));
-        out.push('POST 无任何头           ' + line(R.postBare));
-        out.push('POST +text/plain        ' + line(R.postText));
-        out.push('POST +json头            ' + line(R.postJson));
-        out.push('POST +ba-token          ' + line(R.postTok));
-        out.push('POST +ba-token+json     ' + line(R.postFull));
-        out.push('POST 第三方 httpbin     ' + line(R.postThird));
-        out.push('GET  wx.fjpit.com       ' + line(R.wx));
+        out.push('POST 裸                    ' + line(R.bare));
+        out.push('POST +XRW:XMLHttpRequest   ' + line(R.xrwOnly));
+        out.push('POST +XRW+ba-token+json    ' + line(R.xrwFull));
+        out.push('POST /auth/logout(免鉴权)  ' + line(R.logout));
+        out.push('POST 不存在路径            ' + line(R.nxPath));
+        out.push('GET  scheduleTable         ' + line(R.getSched));
+        out.push('POST httpbin(第三方)       ' + line(R.echo));
         out.push('');
-        out.push('=== WebView 实际请求头 ===');
-        if (R.echo.ok) {
-            let keys = null;
-            try {
-                const j = JSON.parse(R.echo.text);
-                if (j && j.headers) keys = Object.keys(j.headers);
-            } catch (e) { /* 忽略 */ }
-            if (keys) {
-                out.push(keys.join(', '));
-                out.push('含 X-Requested-With ? ' + (keys.some(function (k) {
-                    return k.toLowerCase() === 'x-requested-with';
-                }) ? '是 ★' : '否'));
-            } else {
-                out.push('（响应体过长未解析）');
-            }
-        } else {
-            out.push('失败: ' + R.echo.err);
-        }
+        out.push('=== 第三方回显的 X-Requested-With ===');
+        out.push(xrwEcho);
         out.push('');
-        out.push('=== 已登录？ ===');
-        out.push((function () {
-            try {
-                const r = document.querySelector('#app') || document.body.firstElementChild;
-                const p = r && r.__vue_app__ && r.__vue_app__.config.globalProperties.$pinia;
-                if (!p || !(p._s instanceof Map)) return '无 pinia';
-                for (const e of p._s) {
-                    const s = e[1];
-                    if (s && typeof s.accessToken === 'string' && s.accessToken) return '是';
-                }
-                return '否（' + p._s.size + ' 个 store）';
-            } catch (e) { return '异常: ' + e.message; }
-        })());
+        out.push('=== 各失败响应体片段 ===');
+        [['bare', R.bare], ['xrwOnly', R.xrwOnly], ['xrwFull', R.xrwFull],
+         ['logout', R.logout], ['nxPath', R.nxPath], ['getSched', R.getSched]]
+            .forEach(function (p) {
+                const r = p[1];
+                out.push(p[0] + ': ' + (r.ok ? ('HTTP ' + r.status + ' ' + String(r.text).slice(0, 60))
+                    : ('ERR ' + r.err)));
+            });
 
         const text = out.join('\n');
 
@@ -156,14 +151,14 @@
             document.body.appendChild(box);
         } catch (e) {}
 
-        try { window.shiguangBridge.showToast('诊断v2 完成'); } catch (e) {}
-        try { await window.shiguangBridgePromise.showAlert('福信诊断 v2', text, '知道了'); } catch (e) {}
+        try { window.shiguangBridge.showToast('诊断v3 完成'); } catch (e) {}
+        try { await window.shiguangBridgePromise.showAlert('福信诊断 v3', text, '知道了'); } catch (e) {}
     }
 
-    window.__fjpitDiag2 = run;
+    window.__fjpitDiag3 = run;
     run().catch(function (e) {
         try {
-            window.shiguangBridgePromise.showAlert('诊断v2 异常', String(e && e.message), '知道了');
+            window.shiguangBridgePromise.showAlert('诊断v3 异常', String(e && e.message), '知道了');
         } catch (x) {}
     });
 })();
