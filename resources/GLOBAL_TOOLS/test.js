@@ -71,6 +71,27 @@ function fjpitAttrInt(attrs, name) {
     return n ? parseInt(n[1], 10) : 1;
 }
 
+/**
+ * 把日期对齐到「所在周的周一」，返回 YYYY-MM-DD。
+ *
+ * 为什么需要：移动端前端就是这么算的（`const u = s===0 ? -6 : 1-s; l.setDate(l.getDate()+u)`），
+ * 说明教务给的 startDate 不一定是周一。实测该校的 startDate = 2026-09-09（周三），
+ * 而第 1 周周一应是 2026-09-07 —— 与 HTML 通道解析出的表头日期完全吻合。
+ *
+ * 用 UTC 运算避免设备时区把日期挪走一天。
+ */
+function fjpitAlignToMonday(dateStr) {
+    const m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(String(dateStr == null ? '' : dateStr));
+    if (!m) return '';
+    const d = new Date(Date.UTC(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10)));
+    if (isNaN(d.getTime())) return '';
+    const dow = d.getUTCDay();                       // 0 = 周日
+    const delta = dow === 0 ? -6 : 1 - dow;
+    d.setUTCDate(d.getUTCDate() + delta);
+    const pad = function (n) { return n < 10 ? '0' + n : '' + n; };
+    return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate());
+}
+
 function fjpitSafeToast(msg) {
     try { window.shiguangBridge.showToast(msg); } catch (e) { console.log('JS[toast]: ' + msg); }
 }
@@ -197,53 +218,26 @@ async function fjpitUnlockViewport() {
  * 尺寸处理：电脑模式下 webView 会把浏览器缩放锁到约 0.3 倍，
  * 所以 root 的宽高要除以 zoom；定位只用 0 / 百分比（不受 zoom 影响）。
  */
+/**
+ * 底部状态条（常驻）。
+ * 登录引导走 App 原生弹窗（shiguangBridgePromise.showAlert），
+ * 比页面内的小提示醒目得多。
+ *
+ * 尺寸处理：电脑模式下 WebView 会把缩放锁到约 0.3 倍，
+ * 所以 root 的宽高要除以 zoom；定位只用 0（不受 zoom 影响）。
+ */
 function fjpitBuildControlBar(initialZoom) {
     const root = document.createElement('div');
     root.setAttribute('data-fjpit-ui', '1');
     root.style.cssText = [
-        'position:fixed', 'left:0', 'top:0', 'z-index:2147483647',
-        'pointer-events:none', 'display:flex', 'flex-direction:column',
-        'box-sizing:border-box',
+        'position:fixed', 'left:0', 'right:0', 'bottom:0', 'z-index:2147483647',
+        'pointer-events:none', 'box-sizing:border-box',
         'font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif'
     ].join(';');
 
-    // ---------- 中央引导卡片 ----------
-    const cardWrap = document.createElement('div');
-    cardWrap.style.cssText = 'flex:1 1 auto;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box';
-
-    const card = document.createElement('div');
-    card.style.cssText = [
-        'pointer-events:auto', 'width:100%', 'max-width:340px', 'box-sizing:border-box',
-        'background:#fff', 'color:#1b1f24', 'border-radius:14px',
-        'padding:18px 16px 14px', 'box-shadow:0 10px 34px rgba(0,0,0,.4)',
-        'display:none'
-    ].join(';');
-
-    const cardTitle = document.createElement('div');
-    cardTitle.textContent = '第 1 步：登录教务';
-    cardTitle.style.cssText = 'font-size:17px;font-weight:700;margin-bottom:10px;color:#0b6cff';
-
-    const cardBody = document.createElement('div');
-    cardBody.style.cssText = 'font-size:14px;line-height:1.7;color:#33383f';
-
-    const cardBtn = document.createElement('button');
-    cardBtn.type = 'button';
-    cardBtn.textContent = '收好提示，去登录';
-    cardBtn.style.cssText = [
-        'pointer-events:auto', 'display:block', 'width:100%', 'margin-top:14px',
-        'height:42px', 'border:0', 'border-radius:9px',
-        'background:#0b6cff', 'color:#fff', 'font-size:15px', 'font-weight:600', 'cursor:pointer'
-    ].join(';');
-
-    card.appendChild(cardTitle);
-    card.appendChild(cardBody);
-    card.appendChild(cardBtn);
-    cardWrap.appendChild(card);
-
-    // ---------- 底部状态条 ----------
     const bar = document.createElement('div');
     bar.style.cssText = [
-        'pointer-events:auto', 'flex:0 0 auto', 'width:100%', 'box-sizing:border-box',
+        'pointer-events:auto', 'width:100%', 'box-sizing:border-box',
         'display:flex', 'align-items:center', 'gap:8px',
         'padding:10px 12px',
         'background:rgba(17,20,26,.94)', 'color:#fff',
@@ -281,8 +275,6 @@ function fjpitBuildControlBar(initialZoom) {
 
     bar.appendChild(status);
     bar.appendChild(zoomBox);
-
-    root.appendChild(cardWrap);
     root.appendChild(bar);
     (document.head || document.documentElement).appendChild(root);
 
@@ -290,9 +282,7 @@ function fjpitBuildControlBar(initialZoom) {
 
     function syncSize() {
         const w = Math.round((window.innerWidth || 360) / zoom);
-        const h = Math.round((window.innerHeight || 640) / zoom);
         root.style.width = w + 'px';
-        root.style.height = h + 'px';
     }
 
     function applyZoom(z) {
@@ -305,9 +295,8 @@ function fjpitBuildControlBar(initialZoom) {
         syncSize();
     }
 
-    // 只有在「确实需要缩放补偿」时才露出缩放按钮，平时不干扰
-    const needZoomUI = Math.abs((initialZoom || 1) - 1) > 0.01;
-    if (needZoomUI) zoomBox.style.display = 'flex';
+    // 只有在「确实做了缩放补偿」时才露出缩放按钮，平时不干扰
+    if (Math.abs((initialZoom || 1) - 1) > 0.01) zoomBox.style.display = 'flex';
 
     applyZoom(zoom);
     window.addEventListener('resize', syncSize);
@@ -324,32 +313,33 @@ function fjpitBuildControlBar(initialZoom) {
         } catch (e) {}
     }, 350);
 
-    function hideCard() {
-        card.style.display = 'none';
-        cardWrap.style.display = 'none';
-    }
-
-    cardBtn.addEventListener('click', function () { hideCard(); });
-
     return {
-        /** 显示「请登录」引导卡片 */
+        /**
+         * 弹原生弹窗告诉用户「现在该登录了」。
+         * 返回 Promise：用户点掉弹窗后 resolve，随后进入等待登录。
+         */
         needLogin: function () {
-            cardBody.innerHTML = ''
-                + '<div style="margin-bottom:8px">已为你准备好，可以正常登录了 ✅</div>'
-                + '<div>请点下面的按钮收好本提示，然后在页面中登录你的教务账号。</div>'
-                + '<div style="margin-top:8px;color:#0b6cff">登录成功后会自动开始导入课表，'
-                + '不需要再点任何按钮。</div>';
-            card.style.display = 'block';
-            cardWrap.style.display = 'flex';
             status.textContent = '等待登录…';
+            let p = null;
+            try {
+                p = window.shiguangBridgePromise.showAlert(
+                    '第 1 步：登录教务',
+                    '已为你准备好，现在可以正常登录了。\n\n'
+                    + '教务系统有个限制：不先运行本工具，登录请求会被拦下，'
+                    + '所以需要你先点下面的按钮。\n\n'
+                    + '点「去登录」关闭本提示后，请在页面中登录你的教务账号。\n'
+                    + '登录成功后会自动开始导入课表，不需要再点任何按钮。',
+                    '去登录'
+                );
+            } catch (e) {
+                console.warn('JS: 弹窗失败', e);
+            }
+            return p || Promise.resolve(true);
         },
-        /** 只更新底部文字，不动卡片（等待登录期间用） */
+        /** 只更新底部文字（等待登录期间用） */
         setWaiting: function (t) { status.textContent = t; },
-        /** 更新底部状态；任何一次更新都视为已进入下一阶段，自动收起卡片 */
-        setStatus: function (t) {
-            hideCard();
-            status.textContent = t;
-        },
+        /** 更新底部状态 */
+        setStatus: function (t) { status.textContent = t; },
         destroy: function () {
             try { if (root.parentNode) root.parentNode.removeChild(root); } catch (e) {}
             try { document.documentElement.style.removeProperty('zoom'); } catch (e) {}
@@ -453,7 +443,7 @@ async function fjpitCollectStructured(token, bar) {
     const cfgData = await fjpitApiPost('/semesterConfig', { semester: semester }, token);
     const sc = (cfgData && cfgData.semestersConfig) || cfgData || {};
     const totalWeeks = Number(sc.totalWeeks) || 0;
-    const startDate = String(sc.startDate || '').slice(0, 10);
+    const startDate = fjpitAlignToMonday(sc.startDate);   // 教务给的不一定是周一
     if (!(totalWeeks >= 1)) throw new Error('/semesterConfig 未返回有效 totalWeeks');
     console.log('JS[A]: 开学 ' + startDate + '，共 ' + totalWeeks + ' 周');
 
@@ -777,8 +767,7 @@ async function runImportFlow() {
     // ---- 2. 未登录则等待 ----
     let token = fjpitGetAccessToken();
     if (!token) {
-        bar.needLogin();
-        fjpitSafeToast('请先在页面中登录教务，登录后会自动继续。');
+        await bar.needLogin();   // 原生弹窗，点掉后继续等登录
         token = await fjpitWaitForLogin(bar, Date.now() + FJPIT_LOGIN_WAIT_MS);
         if (!token) {
             bar.destroy();
@@ -859,13 +848,51 @@ async function runImportFlow() {
     }
 
     // ---- 7. 汇总 ----
+    // 统计（便于核对数据是否正确）
+    const nameSet = {};
+    let emptyPos = 0, emptyTea = 0;
+    courses.forEach(function (c) {
+        nameSet[c.name] = 1;
+        if (!c.position) emptyPos++;
+        if (!c.teacher) emptyTea++;
+    });
+    const nameCount = Object.keys(nameSet).length;
+
+    // 尽力导出一份完整调试数据（部分 WebView 不支持下载，失败无妨）
+    try {
+        const payload = {
+            channel: channel,
+            generatedAt: new Date().toISOString(),
+            semesterStartDate: data.semesterStartDate,
+            totalWeeks: data.totalWeeks,
+            timeSlots: data.timeSlots || [],
+            rawEntryCount: data.entries.length,
+            rawEntries: data.entries,
+            courses: courses,
+            meta: data.meta || {}
+        };
+        const blob = new Blob([JSON.stringify(payload, null, 1)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'fjpit-debug-' + Date.now() + '.json';
+        (document.body || document.documentElement).appendChild(a);
+        a.click();
+        setTimeout(function () {
+            try { if (a.parentNode) a.parentNode.removeChild(a); } catch (e) {}
+            try { URL.revokeObjectURL(url); } catch (e) {}
+        }, 3000);
+    } catch (e) { console.warn('JS: 调试导出失败（可忽略）', e); }
+
     const summary = [
         '导入完成',
         '取数通道：' + channel,
-        '课程行数：' + courses.length,
+        '课程行数：' + courses.length + '（' + nameCount + ' 门课）',
+        '原始条目：' + data.entries.length + ' 条',
         '学期周数：' + data.totalWeeks,
         '开学日期：' + (data.semesterStartDate || '未取到'),
         '作息时间：' + (timeSlotSaved ? (data.timeSlots || []).length + ' 节' : '未导入'),
+        '空教师 ' + emptyTea + ' 行 / 空教室 ' + emptyPos + ' 行',
         (data.failedWeeks && data.failedWeeks.length)
             ? '失败周次：' + data.failedWeeks.join(',') : '全部周次抓取成功'
     ];
