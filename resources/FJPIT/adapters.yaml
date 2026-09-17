@@ -1,0 +1,9 @@
+# resources/FJPIT/adapters.yaml
+adapters:
+  - adapter_id: "FJPIT_01"
+    adapter_name: "福建信息职业技术学院教务适配"
+    category: "BACHELOR_AND_ASSOCIATE"
+    asset_js_path: "fjpit_01.js"
+    import_url: "https://jw.fjpit.com/#/auth/login"
+    maintainer: "Panda35064"
+    description: "福信智慧教务（Vben Admin 5.5.6 / 超星教务）。逐周抓取本学期周课表并重建合并单元格，自动导入开学日期与 10 节作息时间。登录后停留任意页面点执行导入即可。"
