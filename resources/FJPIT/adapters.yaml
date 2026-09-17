@@ -6,4 +6,4 @@ adapters:
     asset_js_path: "fjpit_01.js"
     import_url: "https://jw.fjpit.com/#/auth/login"
     maintainer: "Panda35064"
-    description: "福信智慧教务（Vben Admin 5.5.6 / 超星教务）。逐周抓取本学期周课表并重建合并单元格，自动导入开学日期与 10 节作息时间。登录后停留任意页面点执行导入即可。"
+    description: "福信智慧教务（Vben Admin 5.5.6 / 超星教务）。优先直接读取教务接口的结构化课表数据（不解析 HTML），并自动导入开学日期与作息时间。※ 首次使用请先点「执行导入」，按提示登录教务后会自动继续（教务防火墙会拦下未加工的登录请求）；登录状态会保留，之后直接点「执行导入」即可。"
