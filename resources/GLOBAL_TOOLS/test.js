@@ -186,16 +186,68 @@ async function fjpitUnlockViewport() {
     return info;
 }
 
+/**
+ * 页面上的引导 UI。两种形态：
+ *   · 中央引导卡片 —— 只在「还没登录」时出现，明确告诉用户「现在该登录了」
+ *   · 底部状态条   —— 常驻，显示当前进度
+ *
+ * 为什么要卡片：App 里只有一个「执行导入」按钮，而由于教务 WAF 的限制，
+ * 必须先运行本脚本才能正常登录 —— 顺序反直觉，靠 toast 容易被忽略。
+ *
+ * 尺寸处理：电脑模式下 webView 会把浏览器缩放锁到约 0.3 倍，
+ * 所以 root 的宽高要除以 zoom；定位只用 0 / 百分比（不受 zoom 影响）。
+ */
 function fjpitBuildControlBar(initialZoom) {
-    const bar = document.createElement('div');
-    bar.setAttribute('data-fjpit-bar', '1');
-    bar.style.cssText = [
+    const root = document.createElement('div');
+    root.setAttribute('data-fjpit-ui', '1');
+    root.style.cssText = [
         'position:fixed', 'left:0', 'top:0', 'z-index:2147483647',
-        'box-sizing:border-box', 'display:flex', 'align-items:center',
-        'padding:7px 10px', 'gap:8px',
+        'pointer-events:none', 'display:flex', 'flex-direction:column',
+        'box-sizing:border-box',
+        'font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif'
+    ].join(';');
+
+    // ---------- 中央引导卡片 ----------
+    const cardWrap = document.createElement('div');
+    cardWrap.style.cssText = 'flex:1 1 auto;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box';
+
+    const card = document.createElement('div');
+    card.style.cssText = [
+        'pointer-events:auto', 'width:100%', 'max-width:340px', 'box-sizing:border-box',
+        'background:#fff', 'color:#1b1f24', 'border-radius:14px',
+        'padding:18px 16px 14px', 'box-shadow:0 10px 34px rgba(0,0,0,.4)',
+        'display:none'
+    ].join(';');
+
+    const cardTitle = document.createElement('div');
+    cardTitle.textContent = '第 1 步：登录教务';
+    cardTitle.style.cssText = 'font-size:17px;font-weight:700;margin-bottom:10px;color:#0b6cff';
+
+    const cardBody = document.createElement('div');
+    cardBody.style.cssText = 'font-size:14px;line-height:1.7;color:#33383f';
+
+    const cardBtn = document.createElement('button');
+    cardBtn.type = 'button';
+    cardBtn.textContent = '收好提示，去登录';
+    cardBtn.style.cssText = [
+        'pointer-events:auto', 'display:block', 'width:100%', 'margin-top:14px',
+        'height:42px', 'border:0', 'border-radius:9px',
+        'background:#0b6cff', 'color:#fff', 'font-size:15px', 'font-weight:600', 'cursor:pointer'
+    ].join(';');
+
+    card.appendChild(cardTitle);
+    card.appendChild(cardBody);
+    card.appendChild(cardBtn);
+    cardWrap.appendChild(card);
+
+    // ---------- 底部状态条 ----------
+    const bar = document.createElement('div');
+    bar.style.cssText = [
+        'pointer-events:auto', 'flex:0 0 auto', 'width:100%', 'box-sizing:border-box',
+        'display:flex', 'align-items:center', 'gap:8px',
+        'padding:10px 12px',
         'background:rgba(17,20,26,.94)', 'color:#fff',
-        'font:13px/1.35 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif',
-        'box-shadow:0 2px 10px rgba(0,0,0,.35)'
+        'font-size:13px', 'box-shadow:0 -2px 10px rgba(0,0,0,.3)'
     ].join(';');
 
     const status = document.createElement('span');
@@ -223,12 +275,25 @@ function fjpitBuildControlBar(initialZoom) {
     const btnIn = makeBtn('A＋', '放大');
     const btnReset = makeBtn('1:1', '复位');
 
-    bar.appendChild(status);
-    [btnOut, zoomLabel, btnIn, btnReset].forEach(function (el) { bar.appendChild(el); });
+    const zoomBox = document.createElement('span');
+    zoomBox.style.cssText = 'flex:0 0 auto;display:none;align-items:center;gap:6px';
+    [btnOut, zoomLabel, btnIn, btnReset].forEach(function (el) { zoomBox.appendChild(el); });
 
-    (document.head || document.documentElement).appendChild(bar);
+    bar.appendChild(status);
+    bar.appendChild(zoomBox);
+
+    root.appendChild(cardWrap);
+    root.appendChild(bar);
+    (document.head || document.documentElement).appendChild(root);
 
     let zoom = initialZoom || 1;
+
+    function syncSize() {
+        const w = Math.round((window.innerWidth || 360) / zoom);
+        const h = Math.round((window.innerHeight || 640) / zoom);
+        root.style.width = w + 'px';
+        root.style.height = h + 'px';
+    }
 
     function applyZoom(z) {
         zoom = Math.max(0.3, Math.min(4, z));
@@ -236,14 +301,16 @@ function fjpitBuildControlBar(initialZoom) {
             if (Math.abs(zoom - 1) < 0.001) document.documentElement.style.removeProperty('zoom');
             else document.documentElement.style.zoom = String(zoom);
         } catch (e) {}
-        bar.style.width = Math.round((window.innerWidth || 360) / zoom) + 'px';
         zoomLabel.textContent = Math.round(zoom * 100) + '%';
+        syncSize();
     }
 
+    // 只有在「确实需要缩放补偿」时才露出缩放按钮，平时不干扰
+    const needZoomUI = Math.abs((initialZoom || 1) - 1) > 0.01;
+    if (needZoomUI) zoomBox.style.display = 'flex';
+
     applyZoom(zoom);
-    window.addEventListener('resize', function () {
-        bar.style.width = Math.round((window.innerWidth || 360) / zoom) + 'px';
-    });
+    window.addEventListener('resize', syncSize);
 
     btnOut.addEventListener('click', function () { applyZoom(zoom / 1.15); });
     btnIn.addEventListener('click', function () { applyZoom(zoom * 1.15); });
@@ -257,10 +324,34 @@ function fjpitBuildControlBar(initialZoom) {
         } catch (e) {}
     }, 350);
 
+    function hideCard() {
+        card.style.display = 'none';
+        cardWrap.style.display = 'none';
+    }
+
+    cardBtn.addEventListener('click', function () { hideCard(); });
+
     return {
-        setStatus: function (t) { status.textContent = t; },
+        /** 显示「请登录」引导卡片 */
+        needLogin: function () {
+            cardBody.innerHTML = ''
+                + '<div style="margin-bottom:8px">已为你准备好，可以正常登录了 ✅</div>'
+                + '<div>请点下面的按钮收好本提示，然后在页面中登录你的教务账号。</div>'
+                + '<div style="margin-top:8px;color:#0b6cff">登录成功后会自动开始导入课表，'
+                + '不需要再点任何按钮。</div>';
+            card.style.display = 'block';
+            cardWrap.style.display = 'flex';
+            status.textContent = '等待登录…';
+        },
+        /** 只更新底部文字，不动卡片（等待登录期间用） */
+        setWaiting: function (t) { status.textContent = t; },
+        /** 更新底部状态；任何一次更新都视为已进入下一阶段，自动收起卡片 */
+        setStatus: function (t) {
+            hideCard();
+            status.textContent = t;
+        },
         destroy: function () {
-            try { if (bar.parentNode) bar.parentNode.removeChild(bar); } catch (e) {}
+            try { if (root.parentNode) root.parentNode.removeChild(root); } catch (e) {}
             try { document.documentElement.style.removeProperty('zoom'); } catch (e) {}
         }
     };
@@ -656,7 +747,7 @@ async function fjpitWaitForLogin(bar, deadlineTs) {
         const left = Math.ceil((deadlineTs - Date.now()) / 1000);
         if (Date.now() - lastTip > 900) {
             lastTip = Date.now();
-            bar.setStatus('已修复网络，请在页面中登录（' + left + 's）');
+            bar.setWaiting('等待登录（' + left + 's）… 登录后会自动继续');
         }
         await fjpitDelay(700);
     }
@@ -686,8 +777,8 @@ async function runImportFlow() {
     // ---- 2. 未登录则等待 ----
     let token = fjpitGetAccessToken();
     if (!token) {
-        bar.setStatus('未登录 · 已修复网络，请在页面中登录');
-        fjpitSafeToast('网络通道已修复，请直接登录教务，登录后自动继续。');
+        bar.needLogin();
+        fjpitSafeToast('请先在页面中登录教务，登录后会自动继续。');
         token = await fjpitWaitForLogin(bar, Date.now() + FJPIT_LOGIN_WAIT_MS);
         if (!token) {
             bar.destroy();
