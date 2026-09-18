@@ -607,6 +607,40 @@ function fjpitDiagLine(it) {
         + (it.body ? it.body : (it.err || ''));
 }
 
+/** 弹窗里用的短名（手机弹窗一行放不下长名字） */
+function fjpitDiagShort(name) {
+    let s = String(name);
+    s = s.replace('主frame ', '主f ').replace('子frame ', '子f ')
+         .replace('主frame(', '主f(')
+         .replace('POST 字符串body', 'P-str')
+         .replace('POST Blob body', 'P-blob')
+         .replace('POST 字符串', 'P-str')
+         .replace('干净 fetch POST', 'cleanP')
+         .replace('干净 XHR POST', 'cleanX')
+         .replace('（仅原型hook）', '(hook)')
+         .replace('（仅原型hook丢头）', '(hook)')
+         .replace('原生 XHR 类', 'XHR')
+         .replace('(已替换)', '→clean')
+         .replace(/^\w\d\s/, '');
+    if (s.length > 18) s = s.slice(0, 18);
+    return s;
+}
+
+/** 弹窗里用的紧凑行：不带 body（body 另列），只留状态与耗时 */
+function fjpitDiagLineShort(it) {
+    return fjpitDiagPad(fjpitDiagShort(it.name), 20)
+        + fjpitDiagPad(it.ok ? 'OK' : 'FAIL', 6)
+        + fjpitDiagPad(it.status, 6)
+        + (it.ms + 'ms');
+}
+
+/** 把行数组按每段 n 行切开 */
+function fjpitDiagChunks(lines, n) {
+    const out = [];
+    for (let i = 0; i < lines.length; i += n) out.push(lines.slice(i, i + n));
+    return out;
+}
+
 async function fjpitDiagSend(fetcher, path, opts) {
     const o = opts || {};
     const url = /^https?:/.test(path) ? path : (FJPIT_API + path);
@@ -715,25 +749,12 @@ async function runDiagFlow() {
     }
     paint('体检中…\n\n' + D.env.ua + '\n' + D.env.url);
 
-    // ---------- A. 修复前 ----------
+    // ---------- 先保存主 frame 的原始 fetch，但【延迟到最后一组才使用】 ----------
+    // A 组是故意发「会被 WAF 拒」的请求（这正是它的目的）。
+    // 若放在最前面执行，很可能触发教务风控、连带拦掉后面正常的请求，
+    // 从而把「风控连带」误判成「接口不可达」。所以挪到最后。
     let mainFetchRaw = null;
     try { mainFetchRaw = window.fetch.bind(window); } catch (e) {}
-
-    if (mainFetchRaw) {
-        await probe('A1 主frame POST 字符串body', function () {
-            return fjpitDiagSend(mainFetchRaw, '/scheduleTime',
-                { method: 'POST', body: JSON.stringify({ dqz: 1 }) });
-        });
-        await probe('A2 主frame POST Blob body', function () {
-            return fjpitDiagSend(mainFetchRaw, '/scheduleTime',
-                { method: 'POST', body: new Blob([JSON.stringify({ dqz: 1 })], { type: 'application/json' }) });
-        });
-        await probe('A3 主frame GET /semesters', function () {
-            return fjpitDiagSend(mainFetchRaw, '/semesters', {});
-        });
-    } else {
-        add('A0 取 window.fetch', { status: 'ERR', ok: false, err: '拿不到 window.fetch' });
-    }
 
     // ---------- 执行修复 ----------
     const repair = fjpitRepairPageNetwork();
@@ -825,6 +846,28 @@ async function runDiagFlow() {
             });
     });
 
+    // ---------- A（最后执行）：主 frame 原始 fetch 的对照 ----------
+    // 与 B1/B2 的唯一区别就是「用了哪个 fetch」，且都带同样的 token，
+    // 因此可直接判定 App 补丁的影响面。
+    if (mainFetchRaw) {
+        await probe('A1 主frame POST 字符串body', function () {
+            return fjpitDiagSend(mainFetchRaw, '/scheduleTime',
+                { method: 'POST', headers: apiHeaders, body: JSON.stringify({ dqz: 1 }) });
+        });
+        await probe('A2 主frame POST Blob body', function () {
+            return fjpitDiagSend(mainFetchRaw, '/scheduleTime',
+                {
+                    method: 'POST', headers: apiHeaders,
+                    body: new Blob([JSON.stringify({ dqz: 1 })], { type: 'application/json' })
+                });
+        });
+        await probe('A3 主frame GET /semesters', function () {
+            return fjpitDiagSend(mainFetchRaw, '/semesters', { headers: apiHeaders });
+        });
+    } else {
+        add('A0 取 window.fetch', { status: 'ERR', ok: false, err: '拿不到 window.fetch' });
+    }
+
     // ---------- 判定 ----------
     const get = function (n) {
         for (let i = 0; i < D.items.length; i++) {
@@ -890,6 +933,10 @@ async function runDiagFlow() {
         v.push('★ 取数接口部分可达（' + okC.length + '/4），看明细逐项状态');
     }
 
+    v.push('');
+    v.push('注：A 组是故意发「会被 WAF 拒」的请求（这就是它的用途），');
+    v.push('    故安排在最后执行，以免其风控连带影响前面的正常请求。');
+
     D.verdict = v;
     for (let i = 0; i < v.length; i++) console.log('[FJPIT-DIAG] ' + v[i]);
 
@@ -921,28 +968,41 @@ async function runDiagFlow() {
         try { layer.parentNode.removeChild(layer); } catch (e) {}
     });
 
-    // 弹窗内容：结论 + 紧凑明细 + 关键返回（一次可见，不必依赖浮层）
-    const compact = D.items.map(function (it) { return fjpitDiagLine(it); });
+    // ---------- 弹窗（分批） ----------
+    // App 的弹窗内容【不能滚动】，所以按每段 14 行分批弹，确保信息能送达。
+    const flow = [];
+    v.forEach(function (l) { flow.push(l); });
+    flow.push('');
+    flow.push('=== 明细 ===');
+    D.items.forEach(function (it) { flow.push(fjpitDiagLineShort(it)); });
+
     const keyReturns = D.items.filter(function (it) {
+        if (it.err) return true;
         const n = it.name.charAt(0);
-        return n === 'B' || n === 'C' || n === 'E';
+        return (n === 'B' || n === 'C' || n === 'E') && !!it.body;
     }).map(function (it) {
-        return '· ' + it.name + ' → '
-            + (it.body ? it.body.slice(0, 96) : (it.err || '(无)'));
+        return '· ' + fjpitDiagShort(it.name) + ' → '
+            + (it.body ? it.body.slice(0, 88) : (it.err || '(无)'));
     });
 
-    const alertBody = v
-        .concat(['', '=== 明细 ==='])
-        .concat(compact)
-        .concat(['', '=== 关键返回（截断 96 字）==='])
-        .concat(keyReturns)
-        .concat(['', '（上面可滚动；完整明细另见页面浮层）'])
-        .join('\n');
+    if (keyReturns.length) {
+        flow.push('');
+        flow.push('=== 返回原文（截 88 字）===');
+        keyReturns.forEach(function (l) { flow.push(l); });
+    }
 
-    try {
-        await window.shiguangBridgePromise.showAlert('体检结果', alertBody, '知道了');
-    } catch (e) {
-        console.warn('JS: 体检弹窗失败', e);
+    const chunks = fjpitDiagChunks(flow, 14);
+    for (let i = 0; i < chunks.length; i++) {
+        const isLast = (i === chunks.length - 1);
+        try {
+            await window.shiguangBridgePromise.showAlert(
+                '体检结果 ' + (i + 1) + '/' + chunks.length,
+                chunks[i].join('\n'),
+                isLast ? '完成' : '下一段');
+        } catch (e) {
+            console.warn('JS: 体检弹窗失败', e);
+            break;
+        }
     }
 }
 
