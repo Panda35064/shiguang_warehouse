@@ -1,100 +1,18 @@
-// ============================================================
-// 福建信息职业技术学院 · 福信智慧教务 → 拾光课程表 适配脚本
-// ============================================================
-// 教务前端: https://jw.fjpit.com   (Vue3 + Vben Admin 5.5.6, 超星系)
-// 教务接口: https://jw-api.fjpit.com/api
-//
-// ============================================================
-// ★ 取数：直接读教务接口，不解析页面 HTML
-// ============================================================
-// 这套接口来自移动端 m.fjpit.com（与主站共用同一后端与同一鉴权），
-// 返回结构化 JSON，因此不需要做 rowspan/colspan 网格重建，
-// 开学日期、总周数、作息时间也都能直接拿到，无需从页面里抠。
-//
-//   GET  /semesters                        → {semesters:[{label,value,isCurrent,isXxq}]}
-//   POST /semesterConfig {semester}        → {semestersConfig:{startDate,totalWeeks,xxqStartDate,...}}
-//   POST /scheduleTime   {dqz}             → {<key>:{jcdm,jcmc,jcskkssj,jcskjssj,remark}}
-//   POST /schedule {semester,week,showxxq} → {list:[{course,teacherName,spaceName,
-//                                              DayIndex,startNode,endNode,mergeTaskId,...}]}
-//   鉴权：请求头 ba-token + server: 1
-//
-// 官方文档《WebView 页面显示异常的处理》也建议
-// 「放弃从页面 HTML 提取数据，改用 Fetch API 请求接口获取课程数据」。
-//
-// ============================================================
-// ★ X-WebView-Post-Id 是 WAF 的触发点
-// ============================================================
-// App 注入的 JS_INTERCEPT_POST 会给每个带字符串 body 的非 GET 请求
-// 自动加该头，而教务 WAF 直接拒绝带它的请求（fetch 抛 Failed to fetch、耗时极短）。
-// 诊断 v6 铁证：同一接口同一 frame，body 为字符串→FAIL、为 Blob→OK 200。
-//
-// 「电脑模式」救不了它：App 的拦截器要求 requestId != null，
-// 而那个 id 恰恰只能靠这个头传递 —— 可这个头本身就是毒药。
-//
-// 因此本脚本：
-//   1. 修复页面自身网络通道（让用户能正常登录，否则连登录都发不出去）
-//      · window.fetch → 子 frame 的原生实现
-//      · XHR 的 setRequestHeader 包一层丢弃该头（走原型链）
-//   2. 自身所有请求走同一干净通道
-//   （App 的 evaluateJavascript 只注入主 frame，子 frame 是干净的）
-//
-// ------------------------------------------------------------
-// 与官方案例（如 NEUQ / YANGTZEU 树维教务）的关键差异
-// ------------------------------------------------------------
-// 它们的做法是「用户先在页面里登录好 → 点执行导入 → 直接 fetch」，
-// 因为登录发生在独立的 CAS 域名上，绕开了教务系统的 WAF
-// （长江大学的 import_url 就直接指向 CAS 认证页）。
-//
-// 福信不同：登录 POST 就在被 WAF 拦的域名上（诊断 v6：主 frame POST 全 FAIL、
-// 去掉该头的请求全部 200）。所以「先登录」在未加工前走不通，
-// 必须先运行本脚本把请求通道理通 —— 这是学校侧的限制，不是适配设计绕弯。
-//
-// 而且只在【首次使用或登录过期】时需要：token 存在 localStorage
-// （fjpit-vben-auth-core-access），后续打开页面即为已登录，直接点导入即可。
-// ------------------------------------------------------------
-
-// ------------------------------------------------------------
-// ★ 教务 WAF 还有一层「短时速率限制」（2026-09-18 体检发现）
-// ------------------------------------------------------------
-// 同一通道连续发请求时，中间会成片失败：
-//   B1 OK 140ms → B2 OK 71ms → B3 OK 75ms → B4 OK 82ms
-//   → C1 FAIL 88ms → C2 FAIL 75ms → C3 FAIL 89ms   （连续三个都挂）
-//   → C4 OK 201ms → C5/D1/D2/E1/E2 全部 OK
-// 失败耗时只有 70~90ms，远小于正常请求 ⇒ 是「被立即拒绝」而非超时，
-// 且表现为「一段时间窗口内成片全挂、之后自动恢复」。
-// 而逐周抓 /schedule 要连发 20 次 —— 正好是最容易踩中的场景。
-// ⇒ 因此加入请求节流与退避重试（见 fjpitApiRequest）。
-// ------------------------------------------------------------
-
-// ------------------------------------------------------------
-// ★ 关于登录态与页面显示（2026-09-18 用户实测澄清）
-// ------------------------------------------------------------
-// 本机保留登录态时，教务页面自身可能显示不出内容 —— 原因是页面加载那一刻
-// 适配脚本还没注入，SPA 用被 App 补丁污染的通道请求被拦了。
-// **但这只影响页面显示，不影响取数**：本脚本直接调接口、只依赖 token，
-// 而 token 从 Pinia 读取（实测「保留登录态」与「重新登录」都能取到）。
-// ⇒ 因此本脚本不做任何「刷新页面」动作：
-//   整页重载会连同本次注入的修复一起丢掉，而 App 的 JS 补丁每次页面加载
-//   都会注入 ⇒ 重载后页面又被污染，等于白刷。
-//   token 另有 sessionStorage 备份兜底（跨刷新保留），仅作防御。
-// ------------------------------------------------------------
-
-// ------------------------------------------------------------
-// ★ 取数性能：目标 3 秒内跑完全部接口
-// ------------------------------------------------------------
-// 完整接口链共 1 + 2 + N 个请求（N = 总周数，实测 20）：
-//   ① /semesters 串行（后面依赖它的返回值）
-//   ② /semesterConfig + /scheduleTime 并发
-//   ③ /schedule × N 限并发（FJPIT_WEEK_CONCURRENCY）
-// 起始间隔 90ms + 并发 5 ⇒ 约 2.2 秒。
-// 若出现失败，会自动把请求间隔翻倍降速（上限 800ms），
-// 宁可慢一点也要把数据取全；汇总里会报实际耗时。
-// ------------------------------------------------------------
-
-// 数据规则（沿用已验证结论）：
-//   · 教师/教室原样透传：教务给空就是空，不填「无」
-//   · 逐周抓 1~N 周，不用学期计划视图（军训不整周、调课、节假日）
-// ============================================================
+/**
+ * 福建信息职业技术学院（福信智慧教务）课表导入适配脚本
+ *
+ * 教务前端 https://jw.fjpit.com   教务接口 https://jw-api.fjpit.com/api
+ * 鉴权头 ba-token + server: 1；取数直接请求接口，不解析页面 HTML。
+ *
+ * 两个坑：
+ * 1. App 的 JS 补丁给带字符串 body 的非 GET 请求自动加 X-WebView-Post-Id 头，
+ *    教务 WAF 直接拒绝带该头的请求（连页面自身的登录 POST 也中招）。故须先把
+ *    页面网络通道修干净才能登录 ⇒ 首次先点「执行导入」再登录，之后登录态保留。
+ * 2. WAF 有短时速率限制，连续快速请求会被成片拒绝 ⇒ 逐周抓取带节流与退避重试。
+ *
+ * 数据规则：教师/教室按原文原样保留（空即空，不填「无」）；逐周抓 1~N 周，
+ *           不用学期计划视图（军训不整周、调课、节假日）。
+ */
 
 const FJPIT_API = 'https://jw-api.fjpit.com/api';
 const FJPIT_HOST_KEY = 'fjpit.com';
@@ -112,15 +30,7 @@ function fjpitUuid() {
     try { return crypto.randomUUID(); } catch (e) { return 'p-' + Date.now() + '-' + Math.random().toString(36).slice(2); }
 }
 
-/**
- * 把日期对齐到「所在周的周一」，返回 YYYY-MM-DD。
- *
- * 为什么需要：移动端前端就是这么算的（`const u = s===0 ? -6 : 1-s; l.setDate(l.getDate()+u)`），
- * 说明教务给的 startDate 不一定是周一。实测该校的 startDate = 2026-09-09（周三），
- * 而第 1 周周一应是 2026-09-07（该日期另经教务页面表头与移动端算法两处印证）。
- *
- * 用 UTC 运算避免设备时区把日期挪走一天。
- */
+/** 把日期对齐到所在周的周一（教务给的 startDate 不保证是周一）；用 UTC 运算避免时区挪日 */
 function fjpitAlignToMonday(dateStr) {
     const m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(String(dateStr == null ? '' : dateStr));
     if (!m) return '';
@@ -137,9 +47,7 @@ function fjpitSafeToast(msg) {
     try { window.shiguangBridge.showToast(msg); } catch (e) { console.log('JS[toast]: ' + msg); }
 }
 
-// ============================================================
-// 一、干净网络通道（绕开 App 的 JS 补丁）
-// ============================================================
+// ---------- 一、干净网络通道（绕开 App 的 JS 补丁） ----------
 
 let FJPIT_CLEAN_WIN = null;
 let FJPIT_CLEAN_FETCH = null;
@@ -207,9 +115,7 @@ function fjpitRepairPageNetwork() {
     return report;
 }
 
-// ============================================================
-// 二、页面可用性修复 + 控制条
-// ============================================================
+// ---------- 二、页面可用性修复 + 控制条 ----------
 
 function fjpitReadScale() {
     try {
@@ -248,25 +154,8 @@ async function fjpitUnlockViewport() {
     return info;
 }
 
-/**
- * 页面上的引导 UI。两种形态：
- *   · 中央引导卡片 —— 只在「还没登录」时出现，明确告诉用户「现在该登录了」
- *   · 底部状态条   —— 常驻，显示当前进度
- *
- * 为什么要卡片：App 里只有一个「执行导入」按钮，而由于教务 WAF 的限制，
- * 必须先运行本脚本才能正常登录 —— 顺序反直觉，靠 toast 容易被忽略。
- *
- * 尺寸处理：电脑模式下 webView 会把浏览器缩放锁到约 0.3 倍，
- * 所以 root 的宽高要除以 zoom；定位只用 0 / 百分比（不受 zoom 影响）。
- */
-/**
- * 底部状态条（常驻）。
- * 登录引导走 App 原生弹窗（shiguangBridgePromise.showAlert），
- * 比页面内的小提示醒目得多。
- *
- * 尺寸处理：电脑模式下 WebView 会把缩放锁到约 0.3 倍，
- * 所以 root 的宽高要除以 zoom；定位只用 0（不受 zoom 影响）。
- */
+/** 底部状态条：显示进度；登录引导走 App 原生弹窗。
+ *  电脑模式下 WebView 缩放被锁到约 0.3 倍，故宽高需除以 zoom（定位只用 0）。 */
 function fjpitBuildControlBar(initialZoom) {
     const root = document.createElement('div');
     root.setAttribute('data-fjpit-ui', '1');
@@ -355,10 +244,7 @@ function fjpitBuildControlBar(initialZoom) {
     }, 350);
 
     return {
-        /**
-         * 弹原生弹窗告诉用户「现在该登录了」。
-         * 返回 Promise：用户点掉弹窗后 resolve，随后进入等待登录。
-         */
+        /** 弹原生弹窗提示用户登录；点掉弹窗后 resolve */
         needLogin: function () {
             status.textContent = '等待登录…';
             let p = null;
@@ -389,9 +275,7 @@ function fjpitBuildControlBar(initialZoom) {
     };
 }
 
-// ============================================================
-// 三、鉴权
-// ============================================================
+// ---------- 三、鉴权 ----------
 
 /** 会话内 token 备份（sessionStorage 在页面重载后仍保留） */
 const FJPIT_TOKEN_BACKUP_KEY = 'fjpit-token-backup';
@@ -434,16 +318,7 @@ function fjpitTokenFromPinia() {
 /** token 实际来源，便于排查（'pinia' / 'sessionStorage 备份' / ''） */
 let FJPIT_TOKEN_FROM = '';
 
-/**
- * 取 accessToken，两级兜底：
- *   ① Pinia store —— 正常路径，SPA 启动后会把 localStorage 里的 token 解密放进来
- *   ② 本会话备份（sessionStorage）—— 跨页面重载保留
- *
- * 为什么需要 ②：本机保留登录态时，页面加载那一刻脚本还没注入，
- * SPA 用被 App 补丁污染的通道去请求，可能初始化异常、没把 token 放进 store。
- * 这时从 Pinia 是取不到的，但上一轮存下的备份仍然有效，可以直接拿它调接口
- * —— 取数本来就不依赖页面状态。
- */
+/** 取 accessToken：① Pinia store（正常路径）② 本会话的 sessionStorage 备份（兜底） */
 function fjpitGetAccessToken() {
     const t1 = fjpitTokenFromPinia();
     if (t1) {
@@ -491,26 +366,11 @@ function fjpitApiHeaders(token) {
     return h;
 }
 
-// ============================================================
-// 四、取数（结构化 API）
-// ============================================================
+// ---------- 四、取数（结构化 API） ----------
 
-// ------------------------------------------------------------
-// 请求节奏与重试
-// ------------------------------------------------------------
-// 2026-09-18 体检发现：教务 WAF 有【短时速率限制】。
-// 证据：同一通道连续发请求时，中间会成片失败
-//   B1 OK 140ms → B2 OK 71ms → B3 OK 75ms → B4 OK 82ms
-//   → C1 FAIL 88ms → C2 FAIL 75ms → C3 FAIL 89ms
-//   → C4 OK 201ms → C5 OK 113ms → D1/D2/E1/E2 全 OK
-// 失败耗时都只有 70~90ms（远小于正常请求），是被【立即拒绝】的特征，
-// 而不是超时或网络问题；且失败是「一段时间窗口内全挂、之后自动恢复」。
-// 逐周抓 /schedule 要连发 20 次，正好是最容易踩中的场景。
-// ⇒ 因此每个请求之间加间隔，失败后退避重试。
-// 时间预算（目标：23 个请求 3 秒内跑完）
-//   · 起始间隔 90ms + 逐周并发 5 ⇒ 20 周约 1.9s，加前两步约 2.2s
-//   · 但「快」和「不撞限流」是矛盾的：一旦有请求失败，就把间隔翻倍
-//     （上限 800ms）自动降速，宁可慢一点也要把数据取全
+// 请求节奏与重试：教务 WAF 有短时速率限制（实测连续请求会成片被拒，
+// 失败耗时仅 70~90ms 即「被立即拒绝」，过一段时间自动恢复），故请求间加间隔、
+// 失败退避重试；一旦失败就把间隔翻倍自适应降速，宁可慢也要把数据取全。
 const FJPIT_REQ_GAP_MS = 90;        // 相邻请求最小间隔（起始值）
 const FJPIT_GAP_MAX_MS = 800;       // 自适应间隔上限
 const FJPIT_MAX_ATTEMPT = 3;        // 单个请求最多尝试次数
@@ -572,10 +432,7 @@ async function fjpitApiPost(path, body, token) {
     return fjpitApiRequest('POST', path, body, token);
 }
 
-/**
- * 限并发遍历：最多同时执行 limit 个 worker，结果按原顺序返回。
- * 用于把逐周抓取从「串行 N 次」压成「并发若干批」，把总耗时压进 3 秒。
- */
+/** 限并发遍历：最多同时执行 limit 个 worker，结果按原顺序返回 */
 async function fjpitForEachLimit(items, limit, worker) {
     const results = new Array(items.length);
     let next = 0;
@@ -594,17 +451,8 @@ async function fjpitForEachLimit(items, limit, worker) {
     return results;
 }
 
-/**
- * 走结构化 API 取全部数据。
- * 并发取数，目标 3 秒内完成：
- *   · /semesters 必须先跑（后面依赖它返回的 semester）
- *   · /semesterConfig 与 /scheduleTime 互不依赖 → 并发
- *   · 逐周 /schedule 共 N 次 → 限并发 FJPIT_WEEK_CONCURRENCY
- *   · 每次发起前由 fjpitPace() 保证最小间隔，失败时自适应放宽
- *
- * 任一步失败直接抛错。
- * 返回 { entries, timeSlots, semesterStartDate, totalWeeks, failedWeeks, elapsedMs, meta }
- */
+/** 走结构化 API 取全部数据，任一步失败直接抛错。
+ *  并发编排：/semesters 串行 → 配置 + 作息并发 → 逐周限并发 FJPIT_WEEK_CONCURRENCY */
 async function fjpitCollectData(token, bar) {
     const t0 = Date.now();
 
@@ -717,9 +565,7 @@ async function fjpitCollectData(token, bar) {
     };
 }
 
-// ============================================================
-// 五、聚合（教师/教室原样透传）
-// ============================================================
+// ---------- 五、聚合（教师/教室原样透传） ----------
 
 function fjpitAggregate(entries) {
     const SEP = '\u0001';
@@ -748,9 +594,7 @@ function fjpitAggregate(entries) {
     return list;
 }
 
-// ============================================================
-// 六、保存
-// ============================================================
+// ---------- 六、保存 ----------
 
 async function fjpitSaveCourses(courses) {
     await window.shiguangBridgePromise.saveImportedCourses(JSON.stringify(courses, null, 2));
@@ -772,9 +616,7 @@ async function fjpitSaveConfig(semesterStartDate, totalWeeks) {
     await window.shiguangBridgePromise.saveCourseConfig(JSON.stringify(config));
 }
 
-// ============================================================
-// 七、等待登录
-// ============================================================
+// ---------- 七、等待登录 ----------
 
 async function fjpitWaitForLogin(bar, deadlineTs) {
     const bodyRef = document.body;
@@ -793,18 +635,9 @@ async function fjpitWaitForLogin(bar, deadlineTs) {
     return null;
 }
 
-// ============================================================
-// 八、主流程（编排）
-// ============================================================
-// 遵循官方《学校教务系统适配 · 建议与示例》推荐的编排模式：
-//   · runImportFlow 只按顺序调用下面的函数，不含具体业务代码
-//   · 任一关键步骤取消或失败 → 立即 return，不再往下走
-//   · notifyTaskCompletion() 只在【完全成功】之后调用
-//
-// 另：官方《WebView 页面显示异常的处理》一节明确建议
-//   「放弃从页面 HTML 提取数据，改用 Fetch API 请求接口获取课程数据」
-//   —— 本脚本的通道 A（结构化 API）即遵循此建议。
-// ============================================================
+// ---------- 八、主流程（编排） ----------
+// 按官方推荐的编排模式：只做顺序编排；任一步失败立即 return；
+// notifyTaskCompletion() 只在完全成功后调用。
 
 /** 第 1 步：公告式确认（对应官方示例的 promptUserToStart） */
 async function fjpitAskStart() {
@@ -922,10 +755,7 @@ async function fjpitReport(data, saved) {
     fjpitSafeToast('导入成功，共 ' + courses.length + ' 条课程');
 }
 
-/**
- * 编排入口：只做流程编排，具体业务都在上面的函数里。
- * 任一关键步骤失败或用户取消 → 立即 return（不会调用 notifyTaskCompletion）。
- */
+/** 编排入口；任一步失败或用户取消即 return */
 async function runImportFlow() {
     console.log('JS: 福信智慧教务课表导入开始（v11）');
 
