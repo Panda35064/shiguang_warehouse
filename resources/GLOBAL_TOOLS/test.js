@@ -66,6 +66,23 @@
 // ⇒ 因此加入请求节流与退避重试（见 fjpitApiRequest）。
 // ------------------------------------------------------------
 
+// ------------------------------------------------------------
+// ★ 本机保留登录态时的特殊情况（2026-09-18 用户实测）
+// ------------------------------------------------------------
+// 如果本机之前登录过，localStorage 会留下凭证
+// （key = fjpit-vben-auth-core-access），但【页面加载那一刻脚本还没注入】，
+// SPA 用被 App 补丁污染的通道去请求会失败，可能导致初始化异常、
+// 没把 token 解密放进 Pinia —— 于是点「执行导入」时取不到 token。
+//
+// 处理：
+//   · 取不到 token 时先看「页面就绪度」（有无登录表单、localStorage 有无凭证）
+//   · 若「有凭证 + 无登录表单」⇒ 判定为页面未就绪 ⇒ 刷新页面一次，
+//     并提示用户刷新完成后重新点「执行导入」
+//   · token 另存一份到 sessionStorage（跨页面刷新保留）：
+//     这样即使刷新后页面仍未就绪，也能直接用备份 token 调接口
+//     —— 取数本来就不依赖页面状态，只依赖 token
+// ------------------------------------------------------------
+
 // 数据规则（沿用已验证结论）：
 //   · 教师/教室原样透传：教务给空就是空，不填「无」
 //   · 逐周抓 1~N 周，不用学期计划视图（军训不整周、调课、节假日）
@@ -368,7 +385,28 @@ function fjpitBuildControlBar(initialZoom) {
 // 三、鉴权
 // ============================================================
 
-function fjpitGetAccessToken() {
+/** 会话内 token 备份（sessionStorage 在页面重载后仍保留） */
+const FJPIT_TOKEN_BACKUP_KEY = 'fjpit-token-backup';
+const FJPIT_RELOAD_FLAG_KEY = 'fjpit-reloaded';
+
+function fjpitSs() {
+    try { return window.sessionStorage || null; } catch (e) { return null; }
+}
+
+function fjpitReadTokenBackup() {
+    const ss = fjpitSs();
+    if (!ss) return '';
+    try { return String(ss.getItem(FJPIT_TOKEN_BACKUP_KEY) || ''); } catch (e) { return ''; }
+}
+
+function fjpitWriteTokenBackup(t) {
+    const ss = fjpitSs();
+    if (!ss || !t) return;
+    try { ss.setItem(FJPIT_TOKEN_BACKUP_KEY, t); } catch (e) {}
+}
+
+/** 从 Pinia store 取 accessToken（正常路径） */
+function fjpitTokenFromPinia() {
     const root = document.querySelector('#app') || document.body.firstElementChild;
     const app = root && root.__vue_app__;
     if (!app) return null;
@@ -384,6 +422,53 @@ function fjpitGetAccessToken() {
         }
     }
     return fallback;
+}
+
+/** token 实际来源，便于排查（'pinia' / 'sessionStorage 备份' / ''） */
+let FJPIT_TOKEN_FROM = '';
+
+/**
+ * 取 accessToken，两级兜底：
+ *   ① Pinia store —— 正常路径，SPA 启动后会把 localStorage 里的 token 解密放进来
+ *   ② 本会话备份（sessionStorage）—— 跨页面重载保留
+ *
+ * 为什么需要 ②：本机保留登录态时，页面加载那一刻脚本还没注入，
+ * SPA 用被 App 补丁污染的通道去请求，可能初始化异常、没把 token 放进 store。
+ * 这时从 Pinia 是取不到的，但上一轮存下的备份仍然有效，可以直接拿它调接口
+ * —— 取数本来就不依赖页面状态。
+ */
+function fjpitGetAccessToken() {
+    const t1 = fjpitTokenFromPinia();
+    if (t1) {
+        FJPIT_TOKEN_FROM = 'pinia';
+        fjpitWriteTokenBackup(t1);
+        return t1;
+    }
+    const t2 = fjpitReadTokenBackup();
+    if (t2) {
+        FJPIT_TOKEN_FROM = 'sessionStorage 备份';
+        return t2;
+    }
+    FJPIT_TOKEN_FROM = '';
+    return null;
+}
+
+/** 页面就绪度，用于判断「为什么取不到 token」 */
+function fjpitPageState() {
+    const st = { hash: '', hasLoginForm: false, hasLocalCredential: false, piniaStores: 0 };
+    try { st.hash = String(location.hash || ''); } catch (e) {}
+    try { st.hasLoginForm = !!document.querySelector('input[type=password]'); } catch (e) {}
+    try {
+        st.hasLocalCredential = !!window.localStorage.getItem('fjpit-vben-auth-core-access');
+    } catch (e) {}
+    try {
+        const root = document.querySelector('#app') || document.body.firstElementChild;
+        const app = root && root.__vue_app__;
+        const pinia = app && app.config && app.config.globalProperties
+            && app.config.globalProperties.$pinia;
+        st.piniaStores = (pinia && pinia._s instanceof Map) ? pinia._s.size : 0;
+    } catch (e) {}
+    return st;
 }
 
 /** 通道 A（结构化 API）用的头 —— 与移动端 m.fjpit.com 一致 */
@@ -668,11 +753,42 @@ async function fjpitAskStart() {
 /** 第 2 步：确保已登录；未登录则弹公告引导用户登录并等待 */
 async function fjpitEnsureLogin(bar) {
     let token = fjpitGetAccessToken();
-    if (token) return token;
+    if (token) {
+        console.log('JS: token 来源：' + FJPIT_TOKEN_FROM);
+        return token;
+    }
+
+    // 取不到 token 有两种情况，处理方式完全不同：
+    //   A. 确实没登录过 —— 页面会有登录表单 → 走下面的「请登录」引导
+    //   B. 本机有登录记录、但页面没就绪
+    //      （页面加载那一刻脚本还没注入，SPA 用被污染的通道请求、初始化异常，
+    //        于是没把 localStorage 里的 token 解密放进 Pinia）
+    //      → 这种情况刷新一次页面，让 SPA 重新走一遍启动流程
+    const st = fjpitPageState();
+    const ss = fjpitSs();
+    let reloaded = false;
+    try { reloaded = !!(ss && ss.getItem(FJPIT_RELOAD_FLAG_KEY)); } catch (e) {}
+
+    console.log('JS: 未取到 token。页面状态=' + JSON.stringify(st) + '，本会话已刷新过=' + reloaded);
+
+    if (st.hasLocalCredential && !st.hasLoginForm && !reloaded) {
+        try { if (ss) ss.setItem(FJPIT_RELOAD_FLAG_KEY, '1'); } catch (e) {}
+        try {
+            await window.shiguangBridgePromise.showAlert(
+                '页面需要重新加载',
+                '检测到本机有登录记录，但页面没有就绪 —— 很可能是页面加载时的请求被拦截，'
+                + '导致登录状态没有恢复。\n\n'
+                + '点「刷新」后页面会重新加载；加载完成后，请再点一次「执行导入」。',
+                '刷新');
+        } catch (e) {}
+        try { location.reload(); } catch (e) { location.href = location.href; }
+        return null;
+    }
 
     bar.needLogin();
     token = await fjpitWaitForLogin(bar, Date.now() + FJPIT_LOGIN_WAIT_MS);
     if (!token) token = fjpitGetAccessToken();   // 兜底：前端可能刚把 token 写进 store
+    if (token) console.log('JS: token 来源：' + FJPIT_TOKEN_FROM);
     return token;
 }
 
@@ -739,6 +855,7 @@ async function fjpitReport(data, saved) {
 
     const summary = [
         '导入完成',
+        '登录令牌：' + (FJPIT_TOKEN_FROM || '未知'),
         '课程行数：' + courses.length + '（' + nameCount + ' 门课）',
         '原始条目：' + data.entries.length + ' 条',
         '学期周数：' + data.totalWeeks,
