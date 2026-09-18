@@ -53,6 +53,19 @@
 // （fjpit-vben-auth-core-access），后续打开页面即为已登录，直接点导入即可。
 // ------------------------------------------------------------
 
+// ------------------------------------------------------------
+// ★ 教务 WAF 还有一层「短时速率限制」（2026-09-18 体检发现）
+// ------------------------------------------------------------
+// 同一通道连续发请求时，中间会成片失败：
+//   B1 OK 140ms → B2 OK 71ms → B3 OK 75ms → B4 OK 82ms
+//   → C1 FAIL 88ms → C2 FAIL 75ms → C3 FAIL 89ms   （连续三个都挂）
+//   → C4 OK 201ms → C5/D1/D2/E1/E2 全部 OK
+// 失败耗时只有 70~90ms，远小于正常请求 ⇒ 是「被立即拒绝」而非超时，
+// 且表现为「一段时间窗口内成片全挂、之后自动恢复」。
+// 而逐周抓 /schedule 要连发 20 次 —— 正好是最容易踩中的场景。
+// ⇒ 因此加入请求节流与退避重试（见 fjpitApiRequest）。
+// ------------------------------------------------------------
+
 // 数据规则（沿用已验证结论）：
 //   · 教师/教室原样透传：教务给空就是空，不填「无」
 //   · 逐周抓 1~N 周，不用学期计划视图（军训不整周、调课、节假日）
@@ -390,25 +403,68 @@ function fjpitApiHeaders(token) {
 // 四、取数（结构化 API）
 // ============================================================
 
+// ------------------------------------------------------------
+// 请求节奏与重试
+// ------------------------------------------------------------
+// 2026-09-18 体检发现：教务 WAF 有【短时速率限制】。
+// 证据：同一通道连续发请求时，中间会成片失败
+//   B1 OK 140ms → B2 OK 71ms → B3 OK 75ms → B4 OK 82ms
+//   → C1 FAIL 88ms → C2 FAIL 75ms → C3 FAIL 89ms
+//   → C4 OK 201ms → C5 OK 113ms → D1/D2/E1/E2 全 OK
+// 失败耗时都只有 70~90ms（远小于正常请求），是被【立即拒绝】的特征，
+// 而不是超时或网络问题；且失败是「一段时间窗口内全挂、之后自动恢复」。
+// 逐周抓 /schedule 要连发 20 次，正好是最容易踩中的场景。
+// ⇒ 因此每个请求之间加间隔，失败后退避重试。
+const FJPIT_REQ_GAP_MS = 500;      // 相邻请求最小间隔
+const FJPIT_MAX_ATTEMPT = 3;       // 单个请求最多尝试次数
+const FJPIT_RETRY_BASE_MS = 700;   // 退避基数（第 n 次重试等 n × 此值）
+
+let FJPIT_LAST_REQ_AT = 0;
+
+/** 请求节流：保证相邻请求之间有最小间隔 */
+async function fjpitPace() {
+    const wait = FJPIT_REQ_GAP_MS - (Date.now() - FJPIT_LAST_REQ_AT);
+    if (wait > 0) await fjpitDelay(wait);
+    FJPIT_LAST_REQ_AT = Date.now();
+}
+
+/** 统一请求入口：节流 + 重试退避 */
+async function fjpitApiRequest(method, path, body, token) {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= FJPIT_MAX_ATTEMPT; attempt++) {
+        await fjpitPace();
+        try {
+            const init = {
+                method: method,
+                headers: fjpitApiHeaders(token),
+                credentials: 'omit',
+                mode: 'cors'
+            };
+            if (body !== undefined) init.body = JSON.stringify(body);
+            const resp = await fjpitFetch(FJPIT_API + path, init);
+            if (!resp.ok) throw new Error(path + ' HTTP ' + resp.status);
+            const json = await resp.json();
+            if (json.code !== 1) throw new Error(path + ' code=' + json.code + ' ' + (json.msg || ''));
+            return json.data;
+        } catch (e) {
+            lastErr = e;
+            if (attempt < FJPIT_MAX_ATTEMPT) {
+                const back = FJPIT_RETRY_BASE_MS * attempt;
+                console.warn('JS: ' + path + ' 第 ' + attempt + ' 次失败（' + e.message
+                    + '），' + back + 'ms 后重试');
+                await fjpitDelay(back);
+            }
+        }
+    }
+    throw lastErr;
+}
+
 async function fjpitApiGet(path, token) {
-    const resp = await fjpitFetch(FJPIT_API + path, {
-        method: 'GET', headers: fjpitApiHeaders(token), credentials: 'omit', mode: 'cors'
-    });
-    if (!resp.ok) throw new Error(path + ' HTTP ' + resp.status);
-    const json = await resp.json();
-    if (json.code !== 1) throw new Error(path + ' code=' + json.code + ' ' + (json.msg || ''));
-    return json.data;
+    return fjpitApiRequest('GET', path, undefined, token);
 }
 
 async function fjpitApiPost(path, body, token) {
-    const resp = await fjpitFetch(FJPIT_API + path, {
-        method: 'POST', headers: fjpitApiHeaders(token), credentials: 'omit', mode: 'cors',
-        body: JSON.stringify(body)
-    });
-    if (!resp.ok) throw new Error(path + ' HTTP ' + resp.status);
-    const json = await resp.json();
-    if (json.code !== 1) throw new Error(path + ' code=' + json.code + ' ' + (json.msg || ''));
-    return json.data;
+    return fjpitApiRequest('POST', path, body, token);
 }
 
 /**
@@ -458,11 +514,21 @@ async function fjpitCollectData(token, bar) {
 
     // 4) 逐周课表
     const entries = [];
+    const failedWeeks = [];
     for (let w = 1; w <= totalWeeks; w++) {
         bar.setStatus('抓取第 ' + w + '/' + totalWeeks + ' 周…');
-        const d = await fjpitApiPost('/schedule',
-            { semester: semester, week: w, showxxq: showXxq }, token);
-        const list = (d && d.list) || [];
+        let list = [];
+        try {
+            const d = await fjpitApiPost('/schedule',
+                { semester: semester, week: w, showxxq: showXxq }, token);
+            list = (d && d.list) || [];
+        } catch (e) {
+            // 单周失败不中断整个流程（节流与退避重试已在 fjpitApiRequest 内做过），
+            // 记下失败周次继续抓后面的，最后在汇总里一并报出。
+            console.warn('JS: 第 ' + w + ' 周抓取失败: ' + e.message);
+            failedWeeks.push(w);
+            continue;
+        }
         for (let i = 0; i < list.length; i++) {
             const r = list[i];
             if (!r) continue;
@@ -481,9 +547,15 @@ async function fjpitCollectData(token, bar) {
         }
     }
 
+    if (failedWeeks.length > Math.floor(totalWeeks / 2)) {
+        throw new Error('过半周次抓取失败（' + failedWeeks.length + '/' + totalWeeks + '）：'
+            + failedWeeks.join(','));
+    }
+
     return {
         entries: entries, timeSlots: timeSlots,
         semesterStartDate: startDate, totalWeeks: totalWeeks,
+        failedWeeks: failedWeeks,
         meta: { semester: semester }
     };
 }
@@ -565,448 +637,200 @@ async function fjpitWaitForLogin(bar, deadlineTs) {
 }
 
 // ============================================================
-// 八、体检模式（诊断）
+// 八、主流程（编排）
 // ============================================================
-// 目的：判定「昨天能用、今天失效」到底断在哪一层。
+// 遵循官方《学校教务系统适配 · 建议与示例》推荐的编排模式：
+//   · runImportFlow 只按顺序调用下面的函数，不含具体业务代码
+//   · 任一关键步骤取消或失败 → 立即 return，不再往下走
+//   · notifyTaskCompletion() 只在【完全成功】之后调用
 //
-// 探测刻意分成「修复前 / 修复后」两组：
-//   A 组 —— 用 App 补丁污染过的 window.fetch（尚未修复）
-//           A1 字符串 body（补丁会加 X-WebView-Post-Id）→ 预期被 WAF 拒
-//           A2 Blob body（补丁取不到 bodyStr，加不上该头）→ 预期通过
-//           A3 GET（补丁不改 GET）→ 预期通过
-//   B 组 —— 执行修复后再测（window.fetch 已换成子 frame 原生实现）
-//           B1 主 frame 走替换后的 fetch
-//           B2 子 frame 原生 fetch
-//           B3 子 frame 原生 XHR
-//   C 组 —— 四个取数接口逐项
-//   D/E 组 —— 旧接口与旧头组合对照
-//
-// 判定逻辑：
-//   A1 挂 + A2/B* 通   ⇒ 老机制仍成立，失效点在别处（登录态 / 后端 / 保存）
-//   A1 挂 + A2 也挂    ⇒ WAF 拦截面扩大，不再只看那个头
-//   B* 全挂            ⇒ 干净通道被封，修复方案需重做
-//   返回 303           ⇒ 接口层正常，纯粹是未登录
-//   返回 code=1        ⇒ 接口正常，问题在后续环节
+// 另：官方《WebView 页面显示异常的处理》一节明确建议
+//   「放弃从页面 HTML 提取数据，改用 Fetch API 请求接口获取课程数据」
+//   —— 本脚本的通道 A（结构化 API）即遵循此建议。
 // ============================================================
 
-const FJPIT_SEMESTER_FALLBACK = '2026-2027-1';
-
-function fjpitBodyText(t) {
-    return String(t == null ? '' : t).replace(/\s+/g, ' ').slice(0, 200);
-}
-
-function fjpitDiagPad(s, n) {
-    s = String(s);
-    while (s.length < n) s += ' ';
-    return s;
-}
-
-function fjpitDiagLine(it) {
-    return fjpitDiagPad(it.name, 32) + fjpitDiagPad(it.ok ? 'OK' : 'FAIL', 6)
-        + fjpitDiagPad(it.status, 6) + fjpitDiagPad(it.ms + 'ms', 8)
-        + (it.body ? it.body : (it.err || ''));
-}
-
-/** 弹窗里用的短名（手机弹窗一行放不下长名字） */
-function fjpitDiagShort(name) {
-    let s = String(name);
-    s = s.replace('主frame ', '主f ').replace('子frame ', '子f ')
-         .replace('主frame(', '主f(')
-         .replace('POST 字符串body', 'P-str')
-         .replace('POST Blob body', 'P-blob')
-         .replace('POST 字符串', 'P-str')
-         .replace('干净 fetch POST', 'cleanP')
-         .replace('干净 XHR POST', 'cleanX')
-         .replace('（仅原型hook）', '(hook)')
-         .replace('（仅原型hook丢头）', '(hook)')
-         .replace('原生 XHR 类', 'XHR')
-         .replace('(已替换)', '→clean')
-         .replace(/^\w\d\s/, '');
-    if (s.length > 18) s = s.slice(0, 18);
-    return s;
-}
-
-/** 弹窗里用的紧凑行：不带 body（body 另列），只留状态与耗时 */
-function fjpitDiagLineShort(it) {
-    return fjpitDiagPad(fjpitDiagShort(it.name), 20)
-        + fjpitDiagPad(it.ok ? 'OK' : 'FAIL', 6)
-        + fjpitDiagPad(it.status, 6)
-        + (it.ms + 'ms');
-}
-
-/** 把行数组按每段 n 行切开 */
-function fjpitDiagChunks(lines, n) {
-    const out = [];
-    for (let i = 0; i < lines.length; i += n) out.push(lines.slice(i, i + n));
-    return out;
-}
-
-async function fjpitDiagSend(fetcher, path, opts) {
-    const o = opts || {};
-    const url = /^https?:/.test(path) ? path : (FJPIT_API + path);
-    const init = {
-        method: o.method || 'GET',
-        headers: o.headers || { 'Content-Type': 'application/json;charset=UTF-8' },
-        credentials: 'omit',
-        mode: 'cors'
-    };
-    if (o.body !== undefined) init.body = o.body;
-    const t0 = Date.now();
+/** 第 1 步：公告式确认（对应官方示例的 promptUserToStart） */
+async function fjpitAskStart() {
     try {
-        const resp = await fetcher(url, init);
-        let text = '';
-        try { text = await resp.text(); } catch (e) {}
-        return { status: String(resp.status), ok: !!resp.ok, ms: Date.now() - t0, body: fjpitBodyText(text) };
+        return await window.shiguangBridgePromise.showAlert(
+            '福信智慧教务课表导入',
+            '本工具将逐周抓取本学期全部周课表，并自动导入开学日期与作息时间。\n\n'
+            + '数据直接读取教务接口，不解析页面，通常几秒完成。\n'
+            + '请勿中途离开页面。',
+            '开始导入'
+        );
     } catch (e) {
-        return {
-            status: 'ERR', ok: false, ms: Date.now() - t0, body: '',
-            err: ((e && e.name) ? e.name + ': ' : '') + ((e && e.message) || String(e))
-        };
+        console.warn('JS: 确认弹窗失败', e);
+        return false;
     }
 }
 
-function fjpitDiagXhr(XHRClass, url, headers, body) {
-    return new Promise(function (resolve) {
-        const t0 = Date.now();
-        try {
-            const x = new XHRClass();
-            x.open('POST', url, true);
-            const hs = headers || { 'Content-Type': 'application/json;charset=UTF-8', 'server': '1' };
-            for (const k in hs) {
-                if (Object.prototype.hasOwnProperty.call(hs, k)) x.setRequestHeader(k, hs[k]);
-            }
-            x.onload = function () {
-                resolve({
-                    status: String(x.status), ok: x.status >= 200 && x.status < 300,
-                    ms: Date.now() - t0, body: fjpitBodyText(x.responseText)
-                });
-            };
-            x.onerror = function () {
-                resolve({ status: 'ERR', ok: false, ms: Date.now() - t0, body: '', err: 'XHR 网络错误（onerror）' });
-            };
-            x.send(body);
-        } catch (e) {
-            resolve({ status: 'ERR', ok: false, ms: Date.now() - t0, body: '', err: (e && e.message) || String(e) });
-        }
-    });
+/** 第 2 步：确保已登录；未登录则弹公告引导用户登录并等待 */
+async function fjpitEnsureLogin(bar) {
+    let token = fjpitGetAccessToken();
+    if (token) return token;
+
+    bar.needLogin();
+    token = await fjpitWaitForLogin(bar, Date.now() + FJPIT_LOGIN_WAIT_MS);
+    if (!token) token = fjpitGetAccessToken();   // 兜底：前端可能刚把 token 写进 store
+    return token;
 }
 
-async function runDiagFlow() {
-    const D = { items: [], env: {}, verdict: [], t0: Date.now() };
+/** 第 4 步：聚合 + 保存。课程保存失败会抛出（必须中断）；作息与配置尽力而为 */
+async function fjpitSaveAll(data) {
+    const courses = fjpitAggregate(data.entries);
+    console.log('JS: 原始条目 ' + data.entries.length + '，聚合为 ' + courses.length
+        + ' 条课程；开学日期 ' + data.semesterStartDate);
 
-    function add(name, r) {
-        const it = {
-            name: name, ok: !!r.ok, status: r.status || '-',
-            ms: r.ms || 0, body: r.body || '', err: r.err || ''
-        };
-        D.items.push(it);
-        console.log('[FJPIT-DIAG] ' + fjpitDiagLine(it));
-        return it;
-    }
+    await fjpitSaveCourses(courses);
 
-    async function probe(name, fn) {
-        const t0 = Date.now();
-        let r;
-        try { r = await fn(); } catch (e) {
-            r = {
-                status: 'ERR', ok: false, ms: Date.now() - t0, body: '',
-                err: ((e && e.name) ? e.name + ': ' : '') + ((e && e.message) || String(e))
-            };
-        }
-        return add(name, r);
-    }
-
-    // ---------- 0. 环境 ----------
-    let token = null;
-    try { token = fjpitGetAccessToken(); } catch (e) {}
-    D.env.ua = navigator.userAgent;
-    D.env.url = location.href;
-    D.env.host = location.host;
-    D.env.token = token
-        ? (String(token).slice(0, 8) + '…' + String(token).slice(-4) + ' (len ' + String(token).length + ')')
-        : '(未取到)';
-
-    console.log('[FJPIT-DIAG] ========== 体检开始 ==========');
-    console.log('[FJPIT-DIAG] UA: ' + D.env.ua);
-    console.log('[FJPIT-DIAG] URL: ' + D.env.url);
-    console.log('[FJPIT-DIAG] token: ' + D.env.token);
-
-    // 页面浮层（可滚动）
-    const layer = document.createElement('div');
-    layer.setAttribute('data-fjpit-diag', '1');
-    layer.style.cssText = [
-        'position:fixed', 'left:0', 'top:0', 'right:0', 'bottom:0', 'z-index:2147483647',
-        'background:#fff', 'color:#111', 'overflow:auto', '-webkit-overflow-scrolling:touch',
-        'font:12px/1.55 SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace',
-        'padding:12px', 'box-sizing:border-box', 'white-space:pre-wrap', 'word-break:break-all'
-    ].join(';');
-
-    function paint(txt) {
-        try {
-            if (!layer.parentNode) (document.head || document.documentElement).appendChild(layer);
-            layer.textContent = txt;
-        } catch (e) {}
-    }
-    paint('体检中…\n\n' + D.env.ua + '\n' + D.env.url);
-
-    // ---------- 先保存主 frame 的原始 fetch，但【延迟到最后一组才使用】 ----------
-    // A 组是故意发「会被 WAF 拒」的请求（这正是它的目的）。
-    // 若放在最前面执行，很可能触发教务风控、连带拦掉后面正常的请求，
-    // 从而把「风控连带」误判成「接口不可达」。所以挪到最后。
-    let mainFetchRaw = null;
-    try { mainFetchRaw = window.fetch.bind(window); } catch (e) {}
-
-    // ---------- 执行修复 ----------
-    const repair = fjpitRepairPageNetwork();
-    D.env.repair = repair;
-    console.log('[FJPIT-DIAG] 页面网络修复: ' + JSON.stringify(repair));
-
-    // ---------- B. 修复后 ----------
-    const clean = fjpitCleanFetch();
-    const apiHeaders = fjpitApiHeaders(token);
-
-    await probe('B1 主frame(已替换) POST 字符串', function () {
-        return fjpitDiagSend(window.fetch.bind(window), '/scheduleTime',
-            { method: 'POST', headers: apiHeaders, body: JSON.stringify({ dqz: 1 }) });
-    });
-    await probe('B2 子frame 干净 fetch POST', function () {
-        return fjpitDiagSend(clean, '/scheduleTime',
-            { method: 'POST', headers: apiHeaders, body: JSON.stringify({ dqz: 1 }) });
-    });
-    await probe('B3 主frame XHR（仅原型hook）', function () {
-        return fjpitDiagXhr(window.XMLHttpRequest, FJPIT_API + '/scheduleTime', apiHeaders,
-            JSON.stringify({ dqz: 1 }));
-    });
-    await probe('B4 子frame 原生 XHR 类', function () {
-        let XC = null;
-        try { XC = fjpitCleanWindow().XMLHttpRequest; } catch (e) {}
-        if (!XC) return { status: 'ERR', ok: false, body: '', err: '拿不到子 frame 的 XMLHttpRequest' };
-        return fjpitDiagXhr(XC, FJPIT_API + '/scheduleTime', apiHeaders, JSON.stringify({ dqz: 1 }));
-    });
-
-    // ---------- C. 取数接口逐项 ----------
-    let semester = FJPIT_SEMESTER_FALLBACK;
-    const rSem = await probe('C1 GET /semesters', function () {
-        return fjpitDiagSend(clean, '/semesters', { headers: apiHeaders });
-    });
+    let timeSlotSaved = false;
     try {
-        const j = JSON.parse(rSem.body);
-        const list = (j && j.data && j.data.semesters) || [];
-        for (let i = 0; i < list.length; i++) {
-            if (list[i] && list[i].isCurrent) semester = list[i].value || semester;
-        }
-        D.env.semester = semester;
-        D.env.semesterCount = list.length;
-    } catch (e) {}
-
-    await probe('C2 POST /semesterConfig', function () {
-        return fjpitDiagSend(clean, '/semesterConfig',
-            { method: 'POST', headers: apiHeaders, body: JSON.stringify({ semester: semester }) });
-    });
-    await probe('C3 POST /scheduleTime', function () {
-        return fjpitDiagSend(clean, '/scheduleTime',
-            { method: 'POST', headers: apiHeaders, body: JSON.stringify({ dqz: 1 }) });
-    });
-    await probe('C4 POST /schedule (week1)', function () {
-        return fjpitDiagSend(clean, '/schedule',
-            {
-                method: 'POST', headers: apiHeaders,
-                body: JSON.stringify({ semester: semester, week: 1, showxxq: 0 })
-            });
-    });
-    await probe('C5 GET /sectionConfig', function () {
-        return fjpitDiagSend(clean, '/sectionConfig', { headers: apiHeaders });
-    });
-
-    // ---------- D. 旧接口对照 ----------
-    await probe('D1 GET /student/week (旧)', function () {
-        return fjpitDiagSend(clean, '/student/week', { headers: apiHeaders });
-    });
-    await probe('D2 POST /student/scheduleTable (旧)', function () {
-        return fjpitDiagSend(clean, '/student/scheduleTable',
-            { method: 'POST', headers: apiHeaders, body: JSON.stringify({ dqz: 1 }) });
-    });
-
-    // ---------- E. 旧头组合对照 ----------
-    await probe('E1 POST /schedule + is-main 头', function () {
-        const h = fjpitApiHeaders(token);
-        h['is-main'] = 'true';
-        delete h['server'];
-        return fjpitDiagSend(clean, '/schedule',
-            {
-                method: 'POST', headers: h,
-                body: JSON.stringify({ semester: semester, week: 1, showxxq: 0 })
-            });
-    });
-    await probe('E2 POST /schedule 无任何自定义头', function () {
-        return fjpitDiagSend(clean, '/schedule',
-            {
-                method: 'POST', headers: { 'Content-Type': 'application/json;charset=UTF-8' },
-                body: JSON.stringify({ semester: semester, week: 1, showxxq: 0 })
-            });
-    });
-
-    // ---------- A（最后执行）：主 frame 原始 fetch 的对照 ----------
-    // 与 B1/B2 的唯一区别就是「用了哪个 fetch」，且都带同样的 token，
-    // 因此可直接判定 App 补丁的影响面。
-    if (mainFetchRaw) {
-        await probe('A1 主frame POST 字符串body', function () {
-            return fjpitDiagSend(mainFetchRaw, '/scheduleTime',
-                { method: 'POST', headers: apiHeaders, body: JSON.stringify({ dqz: 1 }) });
-        });
-        await probe('A2 主frame POST Blob body', function () {
-            return fjpitDiagSend(mainFetchRaw, '/scheduleTime',
-                {
-                    method: 'POST', headers: apiHeaders,
-                    body: new Blob([JSON.stringify({ dqz: 1 })], { type: 'application/json' })
-                });
-        });
-        await probe('A3 主frame GET /semesters', function () {
-            return fjpitDiagSend(mainFetchRaw, '/semesters', { headers: apiHeaders });
-        });
-    } else {
-        add('A0 取 window.fetch', { status: 'ERR', ok: false, err: '拿不到 window.fetch' });
+        timeSlotSaved = await fjpitSaveTimeSlots(data.timeSlots || []);
+    } catch (e) {
+        console.warn('JS: 作息时间导入失败: ' + e.message);
+    }
+    try {
+        await fjpitSaveConfig(data.semesterStartDate, data.totalWeeks);
+    } catch (e) {
+        console.warn('JS: 课表配置保存失败: ' + e.message);
     }
 
-    // ---------- 判定 ----------
-    const get = function (n) {
-        for (let i = 0; i < D.items.length; i++) {
-            if (D.items[i].name.indexOf(n) === 0) return D.items[i];
-        }
-        return null;
-    };
-    const a1 = get('A1'), a2 = get('A2'), b2 = get('B2'), b3 = get('B3'), b4 = get('B4');
-    const cList = [get('C1'), get('C2'), get('C3'), get('C4')];
-    const v = [];
-
-    if (!token) {
-        v.push('★ 未取到 token（未登录或登录已过期）');
-        v.push('  若各接口返回 303「请先登录」，说明接口层完好，先登录再看');
-    }
-
-    if (a1 && a2) {
-        if (!a1.ok && a2.ok) {
-            v.push('★ A2 通 / A1 挂 → 老机制仍成立');
-            v.push('  X-WebView-Post-Id 依旧是 WAF 触发点，干净通道有效');
-        } else if (!a2.ok) {
-            v.push('★★ A2（不含 id 头的 Blob POST）也挂');
-            v.push('  ⇒ WAF 拦截面已扩大，不再只看那个头');
-        } else {
-            v.push('★ A1/A2 都通 → 当前模式下主 frame POST 未被拦');
-        }
-    }
-
-    if (b2 && b4) {
-        if (b2.ok && b4.ok) {
-            v.push('★ 干净通道正常：子 frame fetch 通 / 子 frame XHR 通 ✓');
-        } else if (!b2.ok && !b4.ok) {
-            v.push('★★ 干净通道也失效 → 修复方案需重做');
-        } else {
-            v.push('★ 干净通道部分失效：子 frame fetch ' + (b2.ok ? '通' : '挂')
-                + ' / 子 frame XHR ' + (b4.ok ? '通' : '挂'));
-        }
-    }
-
-    if (b3) {
-        if (b3.ok) {
-            v.push('★ 主 frame XHR（仅靠原型 hook 丢头）可通');
-        } else {
-            v.push('★★ 主 frame XHR 仍被拦（仅靠 setRequestHeader 原型 hook 无效）');
-            v.push('  ⇒ App 的 XHR 补丁绕过了原型 hook（多半在 send 内部用了原始引用）');
-            v.push('  ⇒ 页面登录走 axios→XHR，因此会失败；需整体替换 window.XMLHttpRequest');
-        }
-    }
-
-    const okC = cList.filter(function (x) { return x && x.ok; });
-    const loginC = cList.filter(function (x) {
-        return x && (x.body.indexOf('请先登录') >= 0 || x.body.indexOf(':303') >= 0);
-    });
-
-    if (okC.length === 4) {
-        v.push('★ 四个取数接口全部可达 ✓ → 数据链路没问题');
-        v.push(loginC.length
-            ? '  但返回「请先登录」→ 仅是登录态问题，重新登录即可'
-            : '  且已返回正常数据 → 问题应在保存/聚合环节');
-    } else if (okC.length === 0) {
-        v.push('★★ 四个取数接口全部不可达 → 服务端或网络层有变化');
-    } else {
-        v.push('★ 取数接口部分可达（' + okC.length + '/4），看明细逐项状态');
-    }
-
-    v.push('');
-    v.push('注：A 组是故意发「会被 WAF 拒」的请求（这就是它的用途），');
-    v.push('    故安排在最后执行，以免其风控连带影响前面的正常请求。');
-
-    D.verdict = v;
-    for (let i = 0; i < v.length; i++) console.log('[FJPIT-DIAG] ' + v[i]);
-
-    // ---------- 输出 ----------
-    const out = [];
-    out.push('=== 结论 ===');
-    v.forEach(function (x) { out.push(x); });
-    out.push('');
-    out.push('=== 环境 ===');
-    out.push('host : ' + D.env.host);
-    out.push('token: ' + D.env.token);
-    out.push('学期 : ' + (D.env.semester || '(未取到，用兜底 ' + FJPIT_SEMESTER_FALLBACK + ')'));
-    out.push('修复 : ' + JSON.stringify(repair));
-    out.push('UA   : ' + D.env.ua);
-    out.push('');
-    out.push('=== 明细 ===');
-    D.items.forEach(function (it) { out.push(fjpitDiagLine(it)); });
-    out.push('');
-    out.push('=== 接口返回原文（截断 200 字）===');
-    D.items.forEach(function (it) {
-        if (it.body) out.push('· ' + it.name + ' → ' + it.body);
-    });
-    out.push('');
-    out.push('耗时合计 ' + (Math.round((Date.now() - D.t0) / 100) / 10) + 's');
-    out.push('（点本浮层空白处可关闭）');
-
-    paint(out.join('\n'));
-    layer.addEventListener('click', function () {
-        try { layer.parentNode.removeChild(layer); } catch (e) {}
-    });
-
-    // ---------- 弹窗（分批） ----------
-    // App 的弹窗内容【不能滚动】，所以按每段 14 行分批弹，确保信息能送达。
-    const flow = [];
-    v.forEach(function (l) { flow.push(l); });
-    flow.push('');
-    flow.push('=== 明细 ===');
-    D.items.forEach(function (it) { flow.push(fjpitDiagLineShort(it)); });
-
-    const keyReturns = D.items.filter(function (it) {
-        if (it.err) return true;
-        const n = it.name.charAt(0);
-        return (n === 'B' || n === 'C' || n === 'E') && !!it.body;
-    }).map(function (it) {
-        return '· ' + fjpitDiagShort(it.name) + ' → '
-            + (it.body ? it.body.slice(0, 88) : (it.err || '(无)'));
-    });
-
-    if (keyReturns.length) {
-        flow.push('');
-        flow.push('=== 返回原文（截 88 字）===');
-        keyReturns.forEach(function (l) { flow.push(l); });
-    }
-
-    const chunks = fjpitDiagChunks(flow, 14);
-    for (let i = 0; i < chunks.length; i++) {
-        const isLast = (i === chunks.length - 1);
-        try {
-            await window.shiguangBridgePromise.showAlert(
-                '体检结果 ' + (i + 1) + '/' + chunks.length,
-                chunks[i].join('\n'),
-                isLast ? '完成' : '下一段');
-        } catch (e) {
-            console.warn('JS: 体检弹窗失败', e);
-            break;
-        }
-    }
+    return { courses: courses, timeSlotSaved: timeSlotSaved };
 }
 
-runDiagFlow().catch(function (e) {
-    console.error('JS: 体检异常', e);
-    try { window.shiguangBridge.showToast('体检异常: ' + (e && e.message)); } catch (x) {}
+/** 第 5 步：汇总公告 + 尽力导出调试数据 */
+async function fjpitReport(data, saved) {
+    const courses = saved.courses;
+
+    const nameSet = {};
+    let emptyPos = 0, emptyTea = 0;
+    courses.forEach(function (c) {
+        nameSet[c.name] = 1;
+        if (!c.position) emptyPos++;
+        if (!c.teacher) emptyTea++;
+    });
+    const nameCount = Object.keys(nameSet).length;
+
+    // 调试导出：部分 WebView 不支持 <a download>，失败不影响流程
+    try {
+        const payload = {
+            generatedAt: new Date().toISOString(),
+            semesterStartDate: data.semesterStartDate,
+            totalWeeks: data.totalWeeks,
+            timeSlots: data.timeSlots || [],
+            rawEntryCount: data.entries.length,
+            rawEntries: data.entries,
+            courses: courses,
+            meta: data.meta || {}
+        };
+        const blob = new Blob([JSON.stringify(payload, null, 1)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'fjpit-debug-' + Date.now() + '.json';
+        (document.body || document.documentElement).appendChild(a);
+        a.click();
+        setTimeout(function () {
+            try { if (a.parentNode) a.parentNode.removeChild(a); } catch (e) {}
+            try { URL.revokeObjectURL(url); } catch (e) {}
+        }, 3000);
+    } catch (e) { console.warn('JS: 调试导出失败（可忽略）', e); }
+
+    const summary = [
+        '导入完成',
+        '课程行数：' + courses.length + '（' + nameCount + ' 门课）',
+        '原始条目：' + data.entries.length + ' 条',
+        '学期周数：' + data.totalWeeks,
+        '开学日期：' + (data.semesterStartDate || '未取到'),
+        '作息时间：' + (saved.timeSlotSaved ? (data.timeSlots || []).length + ' 节' : '未导入'),
+        '空教师 ' + emptyTea + ' 行 / 空教室 ' + emptyPos + ' 行',
+        (data.failedWeeks && data.failedWeeks.length)
+            ? '失败周次：' + data.failedWeeks.join(',') : '全部周次抓取成功'
+    ];
+    console.log('JS: ' + summary.join(' | '));
+
+    await window.shiguangBridgePromise.showAlert('导入完成', summary.join('\n'), '好的');
+    fjpitSafeToast('导入成功，共 ' + courses.length + ' 条课程');
+}
+
+/**
+ * 编排入口：只做流程编排，具体业务都在上面的函数里。
+ * 任一关键步骤失败或用户取消 → 立即 return（不会调用 notifyTaskCompletion）。
+ */
+async function runImportFlow() {
+    console.log('JS: 福信智慧教务课表导入开始（v11）');
+
+    // 0. 环境准备
+    if (location.host.indexOf(FJPIT_HOST_KEY) < 0) {
+        fjpitSafeToast('请先在福信智慧教务页面登录后再执行导入。');
+        return;
+    }
+    const repair = fjpitRepairPageNetwork();
+    console.log('JS: 页面网络通道修复 ' + JSON.stringify(repair));
+
+    const vp = await fjpitUnlockViewport();
+    const bar = fjpitBuildControlBar(vp.zoom);
+
+    // 1. 登录（未登录则弹公告引导 + 等待）
+    const token = await fjpitEnsureLogin(bar);
+    if (!token) {
+        bar.destroy();
+        fjpitSafeToast('未等到登录状态，请登录后重新点「执行导入」。');
+        return;
+    }
+    bar.setStatus('已登录，准备导入…');
+
+    // 2. 确认
+    const confirmed = await fjpitAskStart();
+    if (!confirmed) {
+        bar.destroy();
+        fjpitSafeToast('已取消导入。');
+        return;
+    }
+
+    // 3. 取数（全部走教务接口，不解析页面 HTML）
+    let data;
+    try {
+        data = await fjpitCollectData(token, bar);
+    } catch (e) {
+        bar.destroy();
+        fjpitSafeToast('取数失败：' + e.message);
+        await window.shiguangBridgePromise.showAlert(
+            '取数失败',
+            '未能取到课表数据：\n' + e.message
+            + '\n\n请确认已登录教务系统后重试。',
+            '知道了'
+        );
+        return;
+    }
+    if (!data.entries.length) {
+        bar.setStatus('未取到课程');
+        bar.destroy();
+        fjpitSafeToast('未取到任何课程，请确认本学期是否有排课。');
+        return;
+    }
+
+    // 4. 聚合 + 保存
+    bar.setStatus('保存课程…');
+    let saved;
+    try {
+        saved = await fjpitSaveAll(data);
+    } catch (e) {
+        bar.destroy();
+        fjpitSafeToast('课程保存失败：' + e.message);
+        return;
+    }
+
+    // 5. 汇总
+    bar.destroy();
+    await fjpitReport(data, saved);
+
+    // 6. 完全成功，才发结束信号
+    window.shiguangBridge.notifyTaskCompletion();
+}
+
+runImportFlow().catch(function (e) {
+    console.error('JS: 导入流程异常', e);
+    try { window.shiguangBridge.showToast('导入失败: ' + (e && e.message)); } catch (x) {}
 });
