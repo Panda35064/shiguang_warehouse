@@ -1,105 +1,11 @@
-// ============================================================
-// 福建信息职业技术学院 · 福信智慧教务 → 拾光课程表 适配脚本
-// ============================================================
-// 教务前端: https://jw.fjpit.com   (Vue3 + Vben Admin 5.5.6, 超星系)
-// 教务接口: https://jw-api.fjpit.com/api
-//
-// ============================================================
-// ★ 取数：直接读教务接口，不解析页面 HTML
-// ============================================================
-// 这套接口来自移动端 m.fjpit.com（与主站共用同一后端与同一鉴权），
-// 返回结构化 JSON，因此不需要做 rowspan/colspan 网格重建，
-// 开学日期、总周数、作息时间也都能直接拿到，无需从页面里抠。
-//
-//   GET  /semesters                        → {semesters:[{label,value,isCurrent,isXxq}]}
-//   POST /semesterConfig {semester}        → {semestersConfig:{startDate,totalWeeks,xxqStartDate,...}}
-//   POST /scheduleTime   {dqz}             → {<key>:{jcdm,jcmc,jcskkssj,jcskjssj,remark}}
-//   POST /schedule {semester,week,showxxq} → {list:[{course,teacherName,spaceName,
-//                                              DayIndex,startNode,endNode,mergeTaskId,...}]}
-//   鉴权：请求头 ba-token + server: 1
-//
-// 官方文档《WebView 页面显示异常的处理》也建议
-// 「放弃从页面 HTML 提取数据，改用 Fetch API 请求接口获取课程数据」。
-//
-// ============================================================
-// ★ X-WebView-Post-Id 是 WAF 的触发点
-// ============================================================
-// App 注入的 JS_INTERCEPT_POST 会给每个带字符串 body 的非 GET 请求
-// 自动加该头，而教务 WAF 直接拒绝带它的请求（fetch 抛 Failed to fetch、耗时极短）。
-// 诊断 v6 铁证：同一接口同一 frame，body 为字符串→FAIL、为 Blob→OK 200。
-//
-// 「电脑模式」救不了它：App 的拦截器要求 requestId != null，
-// 而那个 id 恰恰只能靠这个头传递 —— 可这个头本身就是毒药。
-//
-// 因此本脚本：
-//   1. 修复页面自身网络通道（让用户能正常登录，否则连登录都发不出去）
-//      · window.fetch → 子 frame 的原生实现
-//      · XHR 的 setRequestHeader 包一层丢弃该头（走原型链）
-//   2. 自身所有请求走同一干净通道
-//   （App 的 evaluateJavascript 只注入主 frame，子 frame 是干净的）
-//
-// ------------------------------------------------------------
-// 与官方案例（如 NEUQ / YANGTZEU 树维教务）的关键差异
-// ------------------------------------------------------------
-// 它们的做法是「用户先在页面里登录好 → 点执行导入 → 直接 fetch」，
-// 因为登录发生在独立的 CAS 域名上，绕开了教务系统的 WAF
-// （长江大学的 import_url 就直接指向 CAS 认证页）。
-//
-// 福信不同：登录 POST 就在被 WAF 拦的域名上（诊断 v6：主 frame POST 全 FAIL、
-// 去掉该头的请求全部 200）。所以「先登录」在未加工前走不通，
-// 必须先运行本脚本把请求通道理通 —— 这是学校侧的限制，不是适配设计绕弯。
-//
-// 而且只在【首次使用或登录过期】时需要：token 存在 localStorage
-// （fjpit-vben-auth-core-access），后续打开页面即为已登录，直接点导入即可。
-// ------------------------------------------------------------
-
-// ------------------------------------------------------------
-// ★ 教务 WAF 还有一层「短时速率限制」（2026-09-18 体检发现）
-// ------------------------------------------------------------
-// 同一通道连续发请求时，中间会成片失败：
-//   B1 OK 140ms → B2 OK 71ms → B3 OK 75ms → B4 OK 82ms
-//   → C1 FAIL 88ms → C2 FAIL 75ms → C3 FAIL 89ms   （连续三个都挂）
-//   → C4 OK 201ms → C5/D1/D2/E1/E2 全部 OK
-// 失败耗时只有 70~90ms，远小于正常请求 ⇒ 是「被立即拒绝」而非超时，
-// 且表现为「一段时间窗口内成片全挂、之后自动恢复」。
-// 而逐周抓 /schedule 要连发 20 次 —— 正好是最容易踩中的场景。
-// ⇒ 因此加入请求节流与退避重试（见 fjpitApiRequest）。
-// ------------------------------------------------------------
-
-// ------------------------------------------------------------
-// ★ 关于登录态与页面显示（2026-09-18 用户实测澄清）
-// ------------------------------------------------------------
-// 本机保留登录态时，教务页面自身可能显示不出内容 —— 原因是页面加载那一刻
-// 适配脚本还没注入，SPA 用被 App 补丁污染的通道请求被拦了。
-// **但这只影响页面显示，不影响取数**：本脚本直接调接口、只依赖 token，
-// 而 token 从 Pinia 读取（实测「保留登录态」与「重新登录」都能取到）。
-// ⇒ 因此本脚本不做任何「刷新页面」动作：
-//   整页重载会连同本次注入的修复一起丢掉，而 App 的 JS 补丁每次页面加载
-//   都会注入 ⇒ 重载后页面又被污染，等于白刷。
-//   token 另有 sessionStorage 备份兜底（跨刷新保留），仅作防御。
-// ------------------------------------------------------------
-
-// ------------------------------------------------------------
-// ★ 取数性能：目标 3 秒内跑完全部接口
-// ------------------------------------------------------------
-// 完整接口链共 1 + 2 + N 个请求（N = 总周数，实测 20）：
-//   ① /semesters 串行（后面依赖它的返回值）
-//   ② /semesterConfig + /scheduleTime 并发
-//   ③ /schedule × N 限并发（FJPIT_WEEK_CONCURRENCY）
-// 起始间隔 90ms + 并发 5 ⇒ 约 2.2 秒。
-// 若出现失败，会自动把请求间隔翻倍降速（上限 800ms），
-// 宁可慢一点也要把数据取全；汇总里会报实际耗时。
-// ------------------------------------------------------------
-
-// 数据规则（沿用已验证结论）：
-//   · 教师/教室原样透传：教务给空就是空，不填「无」
-//   · 逐周抓 1~N 周，不用学期计划视图（军训不整周、调课、节假日）
-// ============================================================
+// 福建信息职业技术学院（福信智慧教务）课表导入适配脚本
+// 前端 jw.fjpit.com · 接口 jw-api.fjpit.com/api · 鉴权头 ba-token + server: 1
+// 取数直接请求接口，不解析页面 HTML；教师/教室按原文原样保留（空即空）
+// 注意：App 会给非 GET 请求加 X-WebView-Post-Id，教务 WAF 直接拒绝，须先点「执行导入」再登录
 
 const FJPIT_API = 'https://jw-api.fjpit.com/api';
 const FJPIT_HOST_KEY = 'fjpit.com';
 const FJPIT_ID_HEADER = 'x-webview-post-id';
-
 const FJPIT_LOGIN_WAIT_MS = 5 * 60 * 1000;
 
 // ---------- 通用工具 ----------
@@ -112,23 +18,14 @@ function fjpitUuid() {
     try { return crypto.randomUUID(); } catch (e) { return 'p-' + Date.now() + '-' + Math.random().toString(36).slice(2); }
 }
 
-/**
- * 把日期对齐到「所在周的周一」，返回 YYYY-MM-DD。
- *
- * 为什么需要：移动端前端就是这么算的（`const u = s===0 ? -6 : 1-s; l.setDate(l.getDate()+u)`），
- * 说明教务给的 startDate 不一定是周一。实测该校的 startDate = 2026-09-09（周三），
- * 而第 1 周周一应是 2026-09-07（该日期另经教务页面表头与移动端算法两处印证）。
- *
- * 用 UTC 运算避免设备时区把日期挪走一天。
- */
+/** 把日期对齐到所在周的周一（教务给的 startDate 不保证是周一）；用 UTC 运算避免时区挪日 */
 function fjpitAlignToMonday(dateStr) {
     const m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(String(dateStr == null ? '' : dateStr));
     if (!m) return '';
-    const d = new Date(Date.UTC(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10)));
+    const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
     if (isNaN(d.getTime())) return '';
-    const dow = d.getUTCDay();                       // 0 = 周日
-    const delta = dow === 0 ? -6 : 1 - dow;
-    d.setUTCDate(d.getUTCDate() + delta);
+    const dow = d.getUTCDay();                                // 0 = 周日
+    d.setUTCDate(d.getUTCDate() + (dow === 0 ? -6 : 1 - dow));
     const pad = function (n) { return n < 10 ? '0' + n : '' + n; };
     return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate());
 }
@@ -137,53 +34,39 @@ function fjpitSafeToast(msg) {
     try { window.shiguangBridge.showToast(msg); } catch (e) { console.log('JS[toast]: ' + msg); }
 }
 
-// ============================================================
-// 一、干净网络通道（绕开 App 的 JS 补丁）
-// ============================================================
+// ---------- 一、干净网络通道（绕开 App 的 JS 补丁） ----------
 
-let FJPIT_CLEAN_WIN = null;
 let FJPIT_CLEAN_FETCH = null;
 
-function fjpitCleanWindow() {
-    if (FJPIT_CLEAN_WIN && FJPIT_CLEAN_WIN.fetch) return FJPIT_CLEAN_WIN;
-    const ifr = document.createElement('iframe');
-    ifr.setAttribute('data-fjpit-helper', '1');
-    ifr.style.cssText = 'position:fixed;left:-9999px;top:0;width:2px;height:2px;opacity:0;pointer-events:none;border:0';
-    (document.body || document.documentElement).appendChild(ifr);
-    FJPIT_CLEAN_WIN = ifr.contentWindow;
-    return FJPIT_CLEAN_WIN;
-}
-
+/** 取一个没被 App 补丁污染的 fetch：App 只对主 frame 注入补丁，子 frame 是干净的 */
 function fjpitCleanFetch() {
     if (FJPIT_CLEAN_FETCH) return FJPIT_CLEAN_FETCH;
     try {
-        const w = fjpitCleanWindow();
-        const f = w && w.fetch;
-        if (typeof f === 'function') {
-            FJPIT_CLEAN_FETCH = f.bind(w);
-            return FJPIT_CLEAN_FETCH;
-        }
-    } catch (e) {}
+        const ifr = document.createElement('iframe');
+        ifr.style.cssText = 'position:fixed;left:-9999px;top:0;width:2px;height:2px;opacity:0;pointer-events:none;border:0';
+        (document.body || document.documentElement).appendChild(ifr);
+        const f = ifr.contentWindow && ifr.contentWindow.fetch;
+        if (typeof f === 'function') return (FJPIT_CLEAN_FETCH = f.bind(ifr.contentWindow));
+    } catch (e) { }
     try {
-        const g = (typeof window !== 'undefined' && window.fetch) || (typeof fetch !== 'undefined' && fetch);
-        if (typeof g === 'function') FJPIT_CLEAN_FETCH = g.bind(window || null);
-    } catch (e) {}
-    if (!FJPIT_CLEAN_FETCH) {
-        FJPIT_CLEAN_FETCH = function () { return Promise.reject(new Error('当前环境没有可用的 fetch')); };
-    }
-    return FJPIT_CLEAN_FETCH;
+        if (typeof window.fetch === 'function') return (FJPIT_CLEAN_FETCH = window.fetch.bind(window));
+    } catch (e) { }
+    return (FJPIT_CLEAN_FETCH = function () {
+        return Promise.reject(new Error('当前环境没有可用的 fetch'));
+    });
 }
 
 function fjpitFetch(url, init) {
     return fjpitCleanFetch()(url, init);
 }
 
+/** 修好页面请求通道：丢掉 App 补丁加的 X-WebView-Post-Id，否则教务 WAF 会拒掉一切 POST */
 function fjpitRepairPageNetwork() {
     const report = { fetch: false, xhr: false };
 
     try {
         const clean = fjpitCleanFetch();
-        if (typeof clean === 'function' && clean !== window.fetch) {
+        if (clean !== window.fetch) {
             window.fetch = clean;
             report.fetch = true;
         }
@@ -193,10 +76,8 @@ function fjpitRepairPageNetwork() {
         const proto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
         if (proto && !proto.__fjpitHeaderHooked) {
             const prev = proto.setRequestHeader;
-            proto.setRequestHeader = function (header, value) {
-                try {
-                    if (header && String(header).toLowerCase() === FJPIT_ID_HEADER) return;
-                } catch (e) {}
+            proto.setRequestHeader = function (header) {
+                if (String(header || '').toLowerCase() === FJPIT_ID_HEADER) return;
                 return prev.apply(this, arguments);
             };
             proto.__fjpitHeaderHooked = true;
@@ -207,163 +88,26 @@ function fjpitRepairPageNetwork() {
     return report;
 }
 
-// ============================================================
-// 二、页面可用性修复 + 控制条
-// ============================================================
+// ---------- 二、状态条 ----------
 
-function fjpitReadScale() {
-    try {
-        if (window.visualViewport && window.visualViewport.scale) return window.visualViewport.scale;
-    } catch (e) {}
-    return 1;
-}
-
-function fjpitSetViewportMeta(content) {
-    const doc = document;
-    const list = doc.querySelectorAll('meta[name="viewport"]');
-    for (let i = list.length - 1; i >= 0; i--) {
-        if (list[i].parentNode) list[i].parentNode.removeChild(list[i]);
-    }
-    const meta = doc.createElement('meta');
-    meta.setAttribute('name', 'viewport');
-    meta.setAttribute('content', content);
-    (doc.head || doc.documentElement).appendChild(meta);
-    try { window.dispatchEvent(new Event('resize')); } catch (e) {}
-    return meta;
-}
-
-async function fjpitUnlockViewport() {
-    const info = { before: fjpitReadScale(), after: 1, mode: 'none', zoom: 1 };
-    if (info.before >= 0.85) return info;
-
-    fjpitSetViewportMeta(
-        'width=device-width, initial-scale=1.0, minimum-scale=0.25, maximum-scale=5.0, user-scalable=yes'
-    );
-    await fjpitDelay(280);
-    info.after = fjpitReadScale();
-    if (info.after >= 0.85) { info.mode = 'meta'; return info; }
-
-    info.mode = 'zoom';
-    info.zoom = Math.max(1, Math.min(4, 1 / Math.max(0.05, info.after)));
-    return info;
-}
-
-/**
- * 页面上的引导 UI。两种形态：
- *   · 中央引导卡片 —— 只在「还没登录」时出现，明确告诉用户「现在该登录了」
- *   · 底部状态条   —— 常驻，显示当前进度
- *
- * 为什么要卡片：App 里只有一个「执行导入」按钮，而由于教务 WAF 的限制，
- * 必须先运行本脚本才能正常登录 —— 顺序反直觉，靠 toast 容易被忽略。
- *
- * 尺寸处理：电脑模式下 webView 会把浏览器缩放锁到约 0.3 倍，
- * 所以 root 的宽高要除以 zoom；定位只用 0 / 百分比（不受 zoom 影响）。
- */
-/**
- * 底部状态条（常驻）。
- * 登录引导走 App 原生弹窗（shiguangBridgePromise.showAlert），
- * 比页面内的小提示醒目得多。
- *
- * 尺寸处理：电脑模式下 WebView 会把缩放锁到约 0.3 倍，
- * 所以 root 的宽高要除以 zoom；定位只用 0（不受 zoom 影响）。
- */
-function fjpitBuildControlBar(initialZoom) {
+/** 底部状态条：显示进度与等待提示；登录引导走 App 原生弹窗 */
+function fjpitBuildStatusBar() {
     const root = document.createElement('div');
     root.setAttribute('data-fjpit-ui', '1');
-    root.style.cssText = [
-        'position:fixed', 'left:0', 'right:0', 'bottom:0', 'z-index:2147483647',
-        'pointer-events:none', 'box-sizing:border-box',
-        'font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif'
-    ].join(';');
-
-    const bar = document.createElement('div');
-    bar.style.cssText = [
-        'pointer-events:auto', 'width:100%', 'box-sizing:border-box',
-        'display:flex', 'align-items:center', 'gap:8px',
-        'padding:10px 12px',
-        'background:rgba(17,20,26,.94)', 'color:#fff',
-        'font-size:13px', 'box-shadow:0 -2px 10px rgba(0,0,0,.3)'
-    ].join(';');
-
-    const status = document.createElement('span');
-    status.style.cssText = 'flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
-    status.textContent = '准备中…';
-
-    function makeBtn(text, title) {
-        const b = document.createElement('button');
-        b.type = 'button';
-        b.textContent = text;
-        if (title) b.title = title;
-        b.style.cssText = [
-            'flex:0 0 auto', 'min-width:34px', 'height:26px', 'padding:0 8px',
-            'border:1px solid rgba(255,255,255,.28)', 'border-radius:6px',
-            'background:rgba(255,255,255,.10)', 'color:#fff',
-            'font:12px/1 inherit', 'cursor:pointer'
-        ].join(';');
-        return b;
-    }
-
-    const zoomLabel = document.createElement('span');
-    zoomLabel.style.cssText = 'flex:0 0 auto;opacity:.8;font-size:11px';
-
-    const btnOut = makeBtn('A−', '缩小');
-    const btnIn = makeBtn('A＋', '放大');
-    const btnReset = makeBtn('1:1', '复位');
-
-    const zoomBox = document.createElement('span');
-    zoomBox.style.cssText = 'flex:0 0 auto;display:none;align-items:center;gap:6px';
-    [btnOut, zoomLabel, btnIn, btnReset].forEach(function (el) { zoomBox.appendChild(el); });
-
-    bar.appendChild(status);
-    bar.appendChild(zoomBox);
-    root.appendChild(bar);
-    (document.head || document.documentElement).appendChild(root);
-
-    let zoom = initialZoom || 1;
-
-    function syncSize() {
-        const w = Math.round((window.innerWidth || 360) / zoom);
-        root.style.width = w + 'px';
-    }
-
-    function applyZoom(z) {
-        zoom = Math.max(0.3, Math.min(4, z));
-        try {
-            if (Math.abs(zoom - 1) < 0.001) document.documentElement.style.removeProperty('zoom');
-            else document.documentElement.style.zoom = String(zoom);
-        } catch (e) {}
-        zoomLabel.textContent = Math.round(zoom * 100) + '%';
-        syncSize();
-    }
-
-    // 只有在「确实做了缩放补偿」时才露出缩放按钮，平时不干扰
-    if (Math.abs((initialZoom || 1) - 1) > 0.01) zoomBox.style.display = 'flex';
-
-    applyZoom(zoom);
-    window.addEventListener('resize', syncSize);
-
-    btnOut.addEventListener('click', function () { applyZoom(zoom / 1.15); });
-    btnIn.addEventListener('click', function () { applyZoom(zoom * 1.15); });
-    btnReset.addEventListener('click', function () { applyZoom(initialZoom || 1); });
-
-    setTimeout(function () {
-        try {
-            const de = document.documentElement;
-            const visW = (window.visualViewport && window.visualViewport.width) || de.clientWidth;
-            if (de.scrollWidth > visW + 4) window.scrollTo(Math.max(0, (de.scrollWidth - visW) / 2), 0);
-        } catch (e) {}
-    }, 350);
+    root.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147483647;'
+        + 'box-sizing:border-box;padding:10px 12px;pointer-events:none;overflow:hidden;'
+        + 'background:rgba(17,20,26,.94);color:#fff;font-size:13px;line-height:1.5;'
+        + 'text-overflow:ellipsis;white-space:nowrap;'
+        + 'font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif';
+    root.textContent = '准备中…';
+    (document.body || document.head || document.documentElement).appendChild(root);
 
     return {
-        /**
-         * 弹原生弹窗告诉用户「现在该登录了」。
-         * 返回 Promise：用户点掉弹窗后 resolve，随后进入等待登录。
-         */
+        /** 弹原生弹窗提示用户登录；点掉弹窗后 resolve */
         needLogin: function () {
-            status.textContent = '等待登录…';
-            let p = null;
+            root.textContent = '等待登录…';
             try {
-                p = window.shiguangBridgePromise.showAlert(
+                return window.shiguangBridgePromise.showAlert(
                     '第 1 步：登录教务',
                     '福信教务的防火墙会拦下未加工过的登录请求，'
                     + '所以需要你先点一下本工具，把请求通道理通。\n\n'
@@ -375,55 +119,29 @@ function fjpitBuildControlBar(initialZoom) {
                 );
             } catch (e) {
                 console.warn('JS: 弹窗失败', e);
+                return Promise.resolve(true);
             }
-            return p || Promise.resolve(true);
         },
-        /** 只更新底部文字（等待登录期间用） */
-        setWaiting: function (t) { status.textContent = t; },
-        /** 更新底部状态 */
-        setStatus: function (t) { status.textContent = t; },
+        setStatus: function (t) { root.textContent = t; },
         destroy: function () {
-            try { if (root.parentNode) root.parentNode.removeChild(root); } catch (e) {}
-            try { document.documentElement.style.removeProperty('zoom'); } catch (e) {}
+            try { if (root.parentNode) root.parentNode.removeChild(root); } catch (e) { }
         }
     };
 }
 
-// ============================================================
-// 三、鉴权
-// ============================================================
+// ---------- 三、鉴权 ----------
 
-/** 会话内 token 备份（sessionStorage 在页面重载后仍保留） */
-const FJPIT_TOKEN_BACKUP_KEY = 'fjpit-token-backup';
-
-function fjpitSs() {
-    try { return window.sessionStorage || null; } catch (e) { return null; }
-}
-
-function fjpitReadTokenBackup() {
-    const ss = fjpitSs();
-    if (!ss) return '';
-    try { return String(ss.getItem(FJPIT_TOKEN_BACKUP_KEY) || ''); } catch (e) { return ''; }
-}
-
-function fjpitWriteTokenBackup(t) {
-    const ss = fjpitSs();
-    if (!ss || !t) return;
-    try { ss.setItem(FJPIT_TOKEN_BACKUP_KEY, t); } catch (e) {}
-}
-
-/** 从 Pinia store 取 accessToken（正常路径） */
-function fjpitTokenFromPinia() {
+/** 从 Pinia store 取 accessToken；取不到返回 null，由调用方走「请登录」引导 */
+function fjpitGetAccessToken() {
     const root = document.querySelector('#app') || document.body.firstElementChild;
     const app = root && root.__vue_app__;
-    if (!app) return null;
-    const gp = app.config && app.config.globalProperties;
+    const gp = app && app.config && app.config.globalProperties;
     const pinia = gp && gp.$pinia;
     if (!pinia || !(pinia._s instanceof Map)) return null;
     let fallback = null;
     for (const entry of pinia._s) {
         const store = entry[1];
-        if (store && typeof store === 'object' && typeof store.accessToken === 'string' && store.accessToken) {
+        if (store && typeof store.accessToken === 'string' && store.accessToken) {
             if (String(entry[0]).indexOf('access') >= 0) return store.accessToken;
             if (!fallback) fallback = store.accessToken;
         }
@@ -431,54 +149,7 @@ function fjpitTokenFromPinia() {
     return fallback;
 }
 
-/** token 实际来源，便于排查（'pinia' / 'sessionStorage 备份' / ''） */
-let FJPIT_TOKEN_FROM = '';
-
-/**
- * 取 accessToken，两级兜底：
- *   ① Pinia store —— 正常路径，SPA 启动后会把 localStorage 里的 token 解密放进来
- *   ② 本会话备份（sessionStorage）—— 跨页面重载保留
- *
- * 为什么需要 ②：本机保留登录态时，页面加载那一刻脚本还没注入，
- * SPA 用被 App 补丁污染的通道去请求，可能初始化异常、没把 token 放进 store。
- * 这时从 Pinia 是取不到的，但上一轮存下的备份仍然有效，可以直接拿它调接口
- * —— 取数本来就不依赖页面状态。
- */
-function fjpitGetAccessToken() {
-    const t1 = fjpitTokenFromPinia();
-    if (t1) {
-        FJPIT_TOKEN_FROM = 'pinia';
-        fjpitWriteTokenBackup(t1);
-        return t1;
-    }
-    const t2 = fjpitReadTokenBackup();
-    if (t2) {
-        FJPIT_TOKEN_FROM = 'sessionStorage 备份';
-        return t2;
-    }
-    FJPIT_TOKEN_FROM = '';
-    return null;
-}
-
-/** 页面就绪度，用于判断「为什么取不到 token」 */
-function fjpitPageState() {
-    const st = { hash: '', hasLoginForm: false, hasLocalCredential: false, piniaStores: 0 };
-    try { st.hash = String(location.hash || ''); } catch (e) {}
-    try { st.hasLoginForm = !!document.querySelector('input[type=password]'); } catch (e) {}
-    try {
-        st.hasLocalCredential = !!window.localStorage.getItem('fjpit-vben-auth-core-access');
-    } catch (e) {}
-    try {
-        const root = document.querySelector('#app') || document.body.firstElementChild;
-        const app = root && root.__vue_app__;
-        const pinia = app && app.config && app.config.globalProperties
-            && app.config.globalProperties.$pinia;
-        st.piniaStores = (pinia && pinia._s instanceof Map) ? pinia._s.size : 0;
-    } catch (e) {}
-    return st;
-}
-
-/** 通道 A（结构化 API）用的头 —— 与移动端 m.fjpit.com 一致 */
+/** 结构化接口用的头 —— 与移动端 m.fjpit.com 一致 */
 function fjpitApiHeaders(token) {
     const h = {
         'Accept': 'application/json, text/plain, */*',
@@ -491,26 +162,10 @@ function fjpitApiHeaders(token) {
     return h;
 }
 
-// ============================================================
-// 四、取数（结构化 API）
-// ============================================================
+// ---------- 四、取数（结构化 API） ----------
 
-// ------------------------------------------------------------
-// 请求节奏与重试
-// ------------------------------------------------------------
-// 2026-09-18 体检发现：教务 WAF 有【短时速率限制】。
-// 证据：同一通道连续发请求时，中间会成片失败
-//   B1 OK 140ms → B2 OK 71ms → B3 OK 75ms → B4 OK 82ms
-//   → C1 FAIL 88ms → C2 FAIL 75ms → C3 FAIL 89ms
-//   → C4 OK 201ms → C5 OK 113ms → D1/D2/E1/E2 全 OK
-// 失败耗时都只有 70~90ms（远小于正常请求），是被【立即拒绝】的特征，
-// 而不是超时或网络问题；且失败是「一段时间窗口内全挂、之后自动恢复」。
-// 逐周抓 /schedule 要连发 20 次，正好是最容易踩中的场景。
-// ⇒ 因此每个请求之间加间隔，失败后退避重试。
-// 时间预算（目标：23 个请求 3 秒内跑完）
-//   · 起始间隔 90ms + 逐周并发 5 ⇒ 20 周约 1.9s，加前两步约 2.2s
-//   · 但「快」和「不撞限流」是矛盾的：一旦有请求失败，就把间隔翻倍
-//     （上限 800ms）自动降速，宁可慢一点也要把数据取全
+// 教务 WAF 有短时速率限制（连续快速请求会被成片拒绝），故加请求间隔 + 失败退避重试
+// 一旦出现失败就把全局间隔翻倍（上限 800ms）自适应降速，宁可慢也要把数据取全
 const FJPIT_REQ_GAP_MS = 90;        // 相邻请求最小间隔（起始值）
 const FJPIT_GAP_MAX_MS = 800;       // 自适应间隔上限
 const FJPIT_MAX_ATTEMPT = 3;        // 单个请求最多尝试次数
@@ -527,7 +182,7 @@ async function fjpitPace() {
     FJPIT_LAST_REQ_AT = Date.now();
 }
 
-/** 统一请求入口：节流 + 重试退避 */
+/** 统一请求入口：节流 + 失败退避 */
 async function fjpitApiRequest(method, path, body, token) {
     let lastErr = null;
     for (let attempt = 1; attempt <= FJPIT_MAX_ATTEMPT; attempt++) {
@@ -547,12 +202,8 @@ async function fjpitApiRequest(method, path, body, token) {
             return json.data;
         } catch (e) {
             lastErr = e;
-            // 自适应降速：出现失败说明很可能正在撞限流，把全局间隔翻倍
-            const oldGap = FJPIT_CUR_GAP_MS;
+            // 出现失败说明很可能正在撞限流 → 全局间隔翻倍
             FJPIT_CUR_GAP_MS = Math.min(FJPIT_GAP_MAX_MS, FJPIT_CUR_GAP_MS * 2);
-            if (FJPIT_CUR_GAP_MS !== oldGap) {
-                console.warn('JS: 请求失败，请求间隔 ' + oldGap + 'ms → ' + FJPIT_CUR_GAP_MS + 'ms');
-            }
             if (attempt < FJPIT_MAX_ATTEMPT) {
                 const back = FJPIT_RETRY_BASE_MS * attempt;
                 console.warn('JS: ' + path + ' 第 ' + attempt + ' 次失败（' + e.message
@@ -572,18 +223,14 @@ async function fjpitApiPost(path, body, token) {
     return fjpitApiRequest('POST', path, body, token);
 }
 
-/**
- * 限并发遍历：最多同时执行 limit 个 worker，结果按原顺序返回。
- * 用于把逐周抓取从「串行 N 次」压成「并发若干批」，把总耗时压进 3 秒。
- */
+/** 限并发遍历：最多同时执行 limit 个 worker，结果按原顺序返回 */
 async function fjpitForEachLimit(items, limit, worker) {
     const results = new Array(items.length);
-    let next = 0;
     const n = Math.max(1, Math.min(limit | 0, items.length));
+    let next = 0;
     async function runner() {
         for (;;) {
-            const i = next;
-            next++;
+            const i = next++;
             if (i >= items.length) return;
             results[i] = await worker(items[i], i);
         }
@@ -594,17 +241,39 @@ async function fjpitForEachLimit(items, limit, worker) {
     return results;
 }
 
-/**
- * 走结构化 API 取全部数据。
- * 并发取数，目标 3 秒内完成：
- *   · /semesters 必须先跑（后面依赖它返回的 semester）
- *   · /semesterConfig 与 /scheduleTime 互不依赖 → 并发
- *   · 逐周 /schedule 共 N 次 → 限并发 FJPIT_WEEK_CONCURRENCY
- *   · 每次发起前由 fjpitPace() 保证最小间隔，失败时自适应放宽
- *
- * 任一步失败直接抛错。
- * 返回 { entries, timeSlots, semesterStartDate, totalWeeks, failedWeeks, elapsedMs, meta }
- */
+/** 作息列表 → [{number,startTime,endTime}]，编号或时间非法的项丢弃 */
+function fjpitParseTimeSlots(raw) {
+    const arr = Array.isArray(raw) ? raw : Object.values(raw || {});
+    const ok = /^\d{1,2}:\d{2}$/;
+    return arr.map(function (e) {
+        return {
+            number: Number(e && e.jcdm),
+            startTime: String((e && e.jcskkssj) || '').slice(0, 5),
+            endTime: String((e && e.jcskjssj) || '').slice(0, 5)
+        };
+    }).filter(function (t) {
+        return t.number >= 1 && ok.test(t.startTime) && ok.test(t.endTime);
+    }).sort(function (a, b) { return a.number - b.number; });
+}
+
+/** 单条课表记录 → entry；课程名/星期/节次非法的返回 null */
+function fjpitParseEntry(rec, week) {
+    if (!rec) return null;
+    const name = String(rec.course == null ? '' : rec.course).trim();
+    const day = Number(rec.DayIndex);
+    const start = Number(rec.startNode);
+    const end = Number(rec.endNode);
+    if (!name || !(day >= 1 && day <= 7) || !(start >= 1) || !(end >= start)) return null;
+    return {
+        week: week, day: day, date: '',
+        start: start, end: end, name: name,
+        teacher: rec.teacherName == null ? '' : String(rec.teacherName).trim(),
+        room: rec.spaceName == null ? '' : String(rec.spaceName).trim()
+    };
+}
+
+/** 走教务接口取全部数据，任一步失败直接抛错。
+ *  并发编排：/semesters 串行 → 配置 + 作息并发 → 逐周限并发 FJPIT_WEEK_CONCURRENCY */
 async function fjpitCollectData(token, bar) {
     const t0 = Date.now();
 
@@ -613,67 +282,39 @@ async function fjpitCollectData(token, bar) {
     const semData = await fjpitApiGet('/semesters', token);
     const semList = (semData && semData.semesters) || [];
     if (!semList.length) throw new Error('/semesters 无学期数据');
-    let cur = null;
-    for (let i = 0; i < semList.length; i++) if (semList[i] && semList[i].isCurrent) { cur = semList[i]; break; }
-    if (!cur) cur = semList[0];
+    const cur = semList.filter(function (s) { return s && s.isCurrent; })[0] || semList[0];
     const semester = cur.value;
     const showXxq = (cur.isCurrent && cur.isXxq) ? 1 : 0;
-    console.log('JS[A]: 学期 ' + semester + '，showxxq=' + showXxq);
 
-    // 2) 学期配置 + 作息时间（互不依赖 → 并发）
+    // 2) 学期配置（关键，失败即中断）与作息（非关键）并发
     bar.setStatus('读取学期配置与作息…');
-    const pair = await Promise.all([
-        fjpitApiPost('/semesterConfig', { semester: semester }, token).then(
-            function (d) { return { ok: true, data: d }; },
-            function (e) { return { ok: false, error: e }; }),
-        fjpitApiPost('/scheduleTime', { dqz: 1 }, token).then(
-            function (d) { return { ok: true, data: d }; },
-            function (e) { return { ok: false, error: e }; })
-    ]);
-
-    if (!pair[0].ok) throw pair[0].error;           // 学期配置是关键，失败必须中断
-    const sc = (pair[0].data && pair[0].data.semestersConfig) || pair[0].data || {};
+    const slotPromise = fjpitApiPost('/scheduleTime', { dqz: 1 }, token).catch(function (e) {
+        console.warn('JS: 作息读取失败（不影响课表）: ' + e.message);
+        return null;
+    });
+    const cfgData = await fjpitApiPost('/semesterConfig', { semester: semester }, token);
+    const sc = (cfgData && cfgData.semestersConfig) || cfgData || {};
     const totalWeeks = Number(sc.totalWeeks) || 0;
-    const startDate = fjpitAlignToMonday(sc.startDate);   // 教务给的不一定是周一
     if (!(totalWeeks >= 1)) throw new Error('/semesterConfig 未返回有效 totalWeeks');
-    console.log('JS[A]: 开学 ' + startDate + '，共 ' + totalWeeks + ' 周');
-
-    let timeSlots = [];
-    if (pair[1].ok) {
-        try {
-            const arr = Array.isArray(pair[1].data) ? pair[1].data : Object.values(pair[1].data || {});
-            timeSlots = arr.map(function (e) {
-                const num = Number(e && e.jcdm);
-                const st = String((e && e.jcskkssj) || '').slice(0, 5);
-                const et = String((e && e.jcskjssj) || '').slice(0, 5);
-                return { number: num, startTime: st, endTime: et };
-            }).filter(function (t) {
-                return t.number >= 1 && /^\d{1,2}:\d{2}$/.test(t.startTime) && /^\d{1,2}:\d{2}$/.test(t.endTime);
-            }).sort(function (a, b) { return a.number - b.number; });
-        } catch (e) {
-            console.warn('JS[A]: 作息解析失败（不影响课表）: ' + e.message);
-        }
-    } else {
-        console.warn('JS[A]: 作息读取失败（不影响课表）: ' + pair[1].error.message);
-    }
+    const startDate = fjpitAlignToMonday(sc.startDate);      // 教务给的不一定是周一
+    const timeSlots = fjpitParseTimeSlots(await slotPromise);
 
     // 3) 逐周课表（限并发；单周失败只记账不中断）
     bar.setStatus('抓取周课表…');
-    const weekNums = [];
-    for (let w = 1; w <= totalWeeks; w++) weekNums.push(w);
+    const weeks = [];
+    for (let w = 1; w <= totalWeeks; w++) weeks.push(w);
 
     let done = 0;
-    const results = await fjpitForEachLimit(weekNums, FJPIT_WEEK_CONCURRENCY, async function (w) {
+    const results = await fjpitForEachLimit(weeks, FJPIT_WEEK_CONCURRENCY, async function (w) {
         try {
             const d = await fjpitApiPost('/schedule',
                 { semester: semester, week: w, showxxq: showXxq }, token);
-            return { week: w, list: (d && d.list) || [], ok: true };
+            return { week: w, list: Array.isArray(d && d.list) ? d.list : [], ok: true };
         } catch (e) {
             console.warn('JS: 第 ' + w + ' 周抓取失败: ' + e.message);
             return { week: w, list: [], ok: false };
         } finally {
-            done++;
-            bar.setStatus('抓取周课表 ' + done + '/' + totalWeeks + '…');
+            bar.setStatus('抓取周课表 ' + (++done) + '/' + totalWeeks + '…');
         }
     });
 
@@ -681,22 +322,10 @@ async function fjpitCollectData(token, bar) {
     const failedWeeks = [];
     results.forEach(function (r) {
         if (!r.ok) { failedWeeks.push(r.week); return; }
-        for (let i = 0; i < r.list.length; i++) {
-            const rec = r.list[i];
-            if (!rec) continue;
-            const name = String(rec.course == null ? '' : rec.course).trim();
-            const day = Number(rec.DayIndex);
-            const start = Number(rec.startNode);
-            const end = Number(rec.endNode);
-            if (!name || !(day >= 1 && day <= 7) || !(start >= 1) || !(end >= start)) continue;
-            entries.push({
-                week: r.week, day: day, date: '',
-                start: start, end: end,
-                name: name,
-                teacher: rec.teacherName == null ? '' : String(rec.teacherName).trim(),
-                room: rec.spaceName == null ? '' : String(rec.spaceName).trim()
-            });
-        }
+        r.list.forEach(function (rec) {
+            const e = fjpitParseEntry(rec, r.week);
+            if (e) entries.push(e);
+        });
     });
 
     if (failedWeeks.length > Math.floor(totalWeeks / 2)) {
@@ -705,21 +334,17 @@ async function fjpitCollectData(token, bar) {
     }
 
     const elapsedMs = Date.now() - t0;
-    console.log('JS[A]: 取数完成，用时 ' + elapsedMs + 'ms；失败周次 ' + failedWeeks.length
-        + '；最终请求间隔 ' + FJPIT_CUR_GAP_MS + 'ms');
+    console.log('JS: 取数完成 ' + elapsedMs + 'ms；失败周次 ' + failedWeeks.length
+        + '；请求间隔 ' + FJPIT_CUR_GAP_MS + 'ms');
 
     return {
         entries: entries, timeSlots: timeSlots,
         semesterStartDate: startDate, totalWeeks: totalWeeks,
-        failedWeeks: failedWeeks,
-        elapsedMs: elapsedMs,
-        meta: { semester: semester }
+        failedWeeks: failedWeeks, elapsedMs: elapsedMs
     };
 }
 
-// ============================================================
-// 五、聚合（教师/教室原样透传）
-// ============================================================
+// ---------- 五、聚合（教师/教室原样透传） ----------
 
 function fjpitAggregate(entries) {
     const SEP = '\u0001';
@@ -748,17 +373,15 @@ function fjpitAggregate(entries) {
     return list;
 }
 
-// ============================================================
-// 六、保存
-// ============================================================
+// ---------- 六、保存 ----------
 
 async function fjpitSaveCourses(courses) {
     await window.shiguangBridgePromise.saveImportedCourses(JSON.stringify(courses, null, 2));
 }
 
+/** 作息要求编号从 1 起连续，否则不导入（返回 false） */
 async function fjpitSaveTimeSlots(timeSlots) {
     if (!timeSlots.length) return false;
-    timeSlots.sort(function (a, b) { return a.number - b.number; });
     for (let i = 0; i < timeSlots.length; i++) {
         if (timeSlots[i].number !== i + 1) return false;
     }
@@ -772,41 +395,30 @@ async function fjpitSaveConfig(semesterStartDate, totalWeeks) {
     await window.shiguangBridgePromise.saveCourseConfig(JSON.stringify(config));
 }
 
-// ============================================================
-// 七、等待登录
-// ============================================================
+// ---------- 七、等待登录 ----------
 
+/** 轮询等待用户登录；页面被整页重载则提前返回 null */
 async function fjpitWaitForLogin(bar, deadlineTs) {
     const bodyRef = document.body;
     let lastTip = 0;
     while (Date.now() < deadlineTs) {
-        if (document.body !== bodyRef) return null;      // 页面已整页重载
+        if (document.body !== bodyRef) return null;
         const token = fjpitGetAccessToken();
         if (token) return token;
-        const left = Math.ceil((deadlineTs - Date.now()) / 1000);
         if (Date.now() - lastTip > 900) {
             lastTip = Date.now();
-            bar.setWaiting('等待登录（' + left + 's）… 登录后会自动继续');
+            bar.setStatus('等待登录（' + Math.ceil((deadlineTs - Date.now()) / 1000) + 's）… 登录后会自动继续');
         }
         await fjpitDelay(700);
     }
     return null;
 }
 
-// ============================================================
-// 八、主流程（编排）
-// ============================================================
-// 遵循官方《学校教务系统适配 · 建议与示例》推荐的编排模式：
-//   · runImportFlow 只按顺序调用下面的函数，不含具体业务代码
-//   · 任一关键步骤取消或失败 → 立即 return，不再往下走
-//   · notifyTaskCompletion() 只在【完全成功】之后调用
-//
-// 另：官方《WebView 页面显示异常的处理》一节明确建议
-//   「放弃从页面 HTML 提取数据，改用 Fetch API 请求接口获取课程数据」
-//   —— 本脚本的通道 A（结构化 API）即遵循此建议。
-// ============================================================
+// ---------- 八、主流程（编排） ----------
+// 按官方推荐的编排模式：只做顺序编排；任一步失败立即 return；
+// notifyTaskCompletion() 只在完全成功后调用。
 
-/** 第 1 步：公告式确认（对应官方示例的 promptUserToStart） */
+/** 第 1 步：公告式确认 */
 async function fjpitAskStart() {
     try {
         return await window.shiguangBridgePromise.showAlert(
@@ -825,20 +437,11 @@ async function fjpitAskStart() {
 /** 第 2 步：确保已登录；未登录则弹公告引导用户登录并等待 */
 async function fjpitEnsureLogin(bar) {
     let token = fjpitGetAccessToken();
-    if (token) {
-        console.log('JS: token 来源：' + FJPIT_TOKEN_FROM);
-        return token;
-    }
-
-    // 取不到 token ⇒ 走「请登录」引导，等用户登录后自动继续。
-    // （诊断信息仍打一份到日志；App 内看不到控制台，排查以汇总弹窗为准）
-    const st = fjpitPageState();
-    console.log('JS: 未取到 token。页面状态=' + JSON.stringify(st));
+    if (token) return token;
 
     bar.needLogin();
     token = await fjpitWaitForLogin(bar, Date.now() + FJPIT_LOGIN_WAIT_MS);
     if (!token) token = fjpitGetAccessToken();   // 兜底：前端可能刚把 token 写进 store
-    if (token) console.log('JS: token 来源：' + FJPIT_TOKEN_FROM);
     return token;
 }
 
@@ -865,54 +468,20 @@ async function fjpitSaveAll(data) {
     return { courses: courses, timeSlotSaved: timeSlotSaved };
 }
 
-/** 第 5 步：汇总公告 + 尽力导出调试数据 */
+/** 第 5 步：汇总公告 */
 async function fjpitReport(data, saved) {
     const courses = saved.courses;
 
     const nameSet = {};
-    let emptyPos = 0, emptyTea = 0;
-    courses.forEach(function (c) {
-        nameSet[c.name] = 1;
-        if (!c.position) emptyPos++;
-        if (!c.teacher) emptyTea++;
-    });
-    const nameCount = Object.keys(nameSet).length;
-
-    // 调试导出：部分 WebView 不支持 <a download>，失败不影响流程
-    try {
-        const payload = {
-            generatedAt: new Date().toISOString(),
-            semesterStartDate: data.semesterStartDate,
-            totalWeeks: data.totalWeeks,
-            timeSlots: data.timeSlots || [],
-            rawEntryCount: data.entries.length,
-            rawEntries: data.entries,
-            courses: courses,
-            meta: data.meta || {}
-        };
-        const blob = new Blob([JSON.stringify(payload, null, 1)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'fjpit-debug-' + Date.now() + '.json';
-        (document.body || document.documentElement).appendChild(a);
-        a.click();
-        setTimeout(function () {
-            try { if (a.parentNode) a.parentNode.removeChild(a); } catch (e) {}
-            try { URL.revokeObjectURL(url); } catch (e) {}
-        }, 3000);
-    } catch (e) { console.warn('JS: 调试导出失败（可忽略）', e); }
+    courses.forEach(function (c) { nameSet[c.name] = 1; });
 
     const summary = [
         '导入完成',
-        '登录令牌：' + (FJPIT_TOKEN_FROM || '未知'),
-        '取数耗时：' + (data.elapsedMs ? ((data.elapsedMs / 1000).toFixed(1) + 's') : '未知'),
-        '课程行数：' + courses.length + '（' + nameCount + ' 门课）',
-        '原始条目：' + data.entries.length + ' 条',
+        '课程行数：' + courses.length + '（' + Object.keys(nameSet).length + ' 门课）',
         '学期周数：' + data.totalWeeks,
         '开学日期：' + (data.semesterStartDate || '未取到'),
         '作息时间：' + (saved.timeSlotSaved ? (data.timeSlots || []).length + ' 节' : '未导入'),
-        '空教师 ' + emptyTea + ' 行 / 空教室 ' + emptyPos + ' 行',
+        '取数耗时：' + (data.elapsedMs ? ((data.elapsedMs / 1000).toFixed(1) + 's') : '未知'),
         (data.failedWeeks && data.failedWeeks.length)
             ? '失败周次：' + data.failedWeeks.join(',') : '全部周次抓取成功'
     ];
@@ -922,23 +491,17 @@ async function fjpitReport(data, saved) {
     fjpitSafeToast('导入成功，共 ' + courses.length + ' 条课程');
 }
 
-/**
- * 编排入口：只做流程编排，具体业务都在上面的函数里。
- * 任一关键步骤失败或用户取消 → 立即 return（不会调用 notifyTaskCompletion）。
- */
+/** 编排入口；任一步失败或用户取消即 return */
 async function runImportFlow() {
-    console.log('JS: 福信智慧教务课表导入开始（v11）');
+    console.log('JS: 福信智慧教务课表导入开始（v21）');
 
     // 0. 环境准备
     if (location.host.indexOf(FJPIT_HOST_KEY) < 0) {
         fjpitSafeToast('请先在福信智慧教务页面登录后再执行导入。');
         return;
     }
-    const repair = fjpitRepairPageNetwork();
-    console.log('JS: 页面网络通道修复 ' + JSON.stringify(repair));
-
-    const vp = await fjpitUnlockViewport();
-    const bar = fjpitBuildControlBar(vp.zoom);
+    console.log('JS: 页面网络通道修复 ' + JSON.stringify(fjpitRepairPageNetwork()));
+    const bar = fjpitBuildStatusBar();
 
     // 1. 登录（未登录则弹公告引导 + 等待）
     const token = await fjpitEnsureLogin(bar);
@@ -950,8 +513,7 @@ async function runImportFlow() {
     bar.setStatus('已登录，准备导入…');
 
     // 2. 确认
-    const confirmed = await fjpitAskStart();
-    if (!confirmed) {
+    if (!await fjpitAskStart()) {
         bar.destroy();
         fjpitSafeToast('已取消导入。');
         return;
@@ -973,7 +535,6 @@ async function runImportFlow() {
         return;
     }
     if (!data.entries.length) {
-        bar.setStatus('未取到课程');
         bar.destroy();
         fjpitSafeToast('未取到任何课程，请确认本学期是否有排课。');
         return;
@@ -1000,5 +561,5 @@ async function runImportFlow() {
 
 runImportFlow().catch(function (e) {
     console.error('JS: 导入流程异常', e);
-    try { window.shiguangBridge.showToast('导入失败: ' + (e && e.message)); } catch (x) {}
+    try { window.shiguangBridge.showToast('导入失败: ' + (e && e.message)); } catch (x) { }
 });
