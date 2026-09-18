@@ -67,20 +67,28 @@
 // ------------------------------------------------------------
 
 // ------------------------------------------------------------
-// ★ 本机保留登录态时的特殊情况（2026-09-18 用户实测）
+// ★ 关于登录态与页面显示（2026-09-18 用户实测澄清）
 // ------------------------------------------------------------
-// 本机之前登录过时，localStorage 会留下凭证
-// （key = fjpit-vben-auth-core-access）。但【页面加载那一刻脚本还没注入】，
-// SPA 用被 App 补丁污染的通道去请求会被拦下，页面自身的数据因此没取到。
-//
-// 处理两条，互不冲突：
-//   · 【页面内部刷新】已登录时，取数前先触发一次页面自身的刷新
-//     （找到页面上的刷新按钮并点击），让页面重新取一遍数据。
-//     ⚠ 必须用「页面内部刷新」，**绝不能用 location.reload()**：
-//        整页重载会连同本次注入的修复一起丢掉，而 App 的 JS 补丁
-//        每次页面加载都会注入 ⇒ 重载后页面又回到被污染状态，等于白刷。
-//   · 【token 两级兜底】Pinia 取不到 token 时，改用 sessionStorage 备份
-//     （跨页面刷新保留）—— 因为取数只依赖 token，不依赖页面状态。
+// 本机保留登录态时，教务页面自身可能显示不出内容 —— 原因是页面加载那一刻
+// 适配脚本还没注入，SPA 用被 App 补丁污染的通道请求被拦了。
+// **但这只影响页面显示，不影响取数**：本脚本直接调接口、只依赖 token，
+// 而 token 从 Pinia 读取（实测「保留登录态」与「重新登录」都能取到）。
+// ⇒ 因此本脚本不做任何「刷新页面」动作：
+//   整页重载会连同本次注入的修复一起丢掉，而 App 的 JS 补丁每次页面加载
+//   都会注入 ⇒ 重载后页面又被污染，等于白刷。
+//   token 另有 sessionStorage 备份兜底（跨刷新保留），仅作防御。
+// ------------------------------------------------------------
+
+// ------------------------------------------------------------
+// ★ 取数性能：目标 3 秒内跑完全部接口
+// ------------------------------------------------------------
+// 完整接口链共 1 + 2 + N 个请求（N = 总周数，实测 20）：
+//   ① /semesters 串行（后面依赖它的返回值）
+//   ② /semesterConfig + /scheduleTime 并发
+//   ③ /schedule × N 限并发（FJPIT_WEEK_CONCURRENCY）
+// 起始间隔 90ms + 并发 5 ⇒ 约 2.2 秒。
+// 若出现失败，会自动把请求间隔翻倍降速（上限 800ms），
+// 宁可慢一点也要把数据取全；汇总里会报实际耗时。
 // ------------------------------------------------------------
 
 // 数据规则（沿用已验证结论）：
@@ -387,8 +395,6 @@ function fjpitBuildControlBar(initialZoom) {
 
 /** 会话内 token 备份（sessionStorage 在页面重载后仍保留） */
 const FJPIT_TOKEN_BACKUP_KEY = 'fjpit-token-backup';
-const FJPIT_REFRESH_BEFORE_IMPORT = true;   // 已登录时，取数前先触发一次页面内部刷新
-let FJPIT_REFRESH_HOW = '';                 // 本次内部刷新的结果（'button' / ''），供汇总显示
 
 function fjpitSs() {
     try { return window.sessionStorage || null; } catch (e) { return null; }
@@ -472,62 +478,6 @@ function fjpitPageState() {
     return st;
 }
 
-/**
- * 找教务页面自带的「刷新」按钮。
- * 只扫真正可点击的元素（button / a / role=button / i / svg），
- * 用 title、aria-label、class、id 里的 refresh / reload / 刷新 关键字匹配。
- */
-function fjpitFindRefreshButton() {
-    const nodes = document.querySelectorAll('button, a, [role="button"], i, svg');
-    for (let i = 0; i < nodes.length; i++) {
-        const el = nodes[i];
-        let cls = '';
-        try {
-            cls = (typeof el.className === 'string')
-                ? el.className
-                : ((el.className && el.className.baseVal) || '');
-        } catch (e) {}
-        const hint = [
-            (el.getAttribute && el.getAttribute('title')) || '',
-            (el.getAttribute && el.getAttribute('aria-label')) || '',
-            (el.getAttribute && el.getAttribute('data-icon')) || '',
-            cls, el.id || ''
-        ].join(' ').toLowerCase();
-        if (!hint) continue;
-        if (/refresh|reload|刷新/.test(hint)) return el;
-    }
-    return null;
-}
-
-/**
- * 触发教务页面自身的「内部刷新」——**不整页重载**。
- *
- * 为什么不能用 location.reload()：适配脚本只在点「执行导入」时注入，
- * 整页重载会让本次注入连同所有修复一起消失；而 App 的 JS 补丁是
- * 每次页面加载都注入的 ⇒ 重载后页面又回到被污染的状态，等于白刷。
- *
- * 返回触发方式（'button' / ''），供日志与排查使用。
- */
-async function fjpitRefreshInPage() {
-    try {
-        const btn = fjpitFindRefreshButton();
-        if (btn) {
-            let desc = '';
-            try {
-                desc = (btn.getAttribute && (btn.getAttribute('title') || btn.getAttribute('aria-label')))
-                    || btn.id || (btn.tagName || '').toLowerCase();
-            } catch (e) {}
-            btn.click();
-            console.log('JS: 内部刷新 → 已点击页面刷新按钮（' + desc + '）');
-            await fjpitDelay(1200);
-            return 'button';
-        }
-    } catch (e) {
-        console.warn('JS: 点击刷新按钮失败', e);
-    }
-    return '';
-}
-
 /** 通道 A（结构化 API）用的头 —— 与移动端 m.fjpit.com 一致 */
 function fjpitApiHeaders(token) {
     const h = {
@@ -557,15 +507,22 @@ function fjpitApiHeaders(token) {
 // 而不是超时或网络问题；且失败是「一段时间窗口内全挂、之后自动恢复」。
 // 逐周抓 /schedule 要连发 20 次，正好是最容易踩中的场景。
 // ⇒ 因此每个请求之间加间隔，失败后退避重试。
-const FJPIT_REQ_GAP_MS = 500;      // 相邻请求最小间隔
-const FJPIT_MAX_ATTEMPT = 3;       // 单个请求最多尝试次数
-const FJPIT_RETRY_BASE_MS = 700;   // 退避基数（第 n 次重试等 n × 此值）
+// 时间预算（目标：23 个请求 3 秒内跑完）
+//   · 起始间隔 90ms + 逐周并发 5 ⇒ 20 周约 1.9s，加前两步约 2.2s
+//   · 但「快」和「不撞限流」是矛盾的：一旦有请求失败，就把间隔翻倍
+//     （上限 800ms）自动降速，宁可慢一点也要把数据取全
+const FJPIT_REQ_GAP_MS = 90;        // 相邻请求最小间隔（起始值）
+const FJPIT_GAP_MAX_MS = 800;       // 自适应间隔上限
+const FJPIT_MAX_ATTEMPT = 3;        // 单个请求最多尝试次数
+const FJPIT_RETRY_BASE_MS = 400;    // 退避基数（第 n 次重试等 n × 此值）
+const FJPIT_WEEK_CONCURRENCY = 5;   // 逐周抓取的并发度
 
+let FJPIT_CUR_GAP_MS = FJPIT_REQ_GAP_MS;
 let FJPIT_LAST_REQ_AT = 0;
 
-/** 请求节流：保证相邻请求之间有最小间隔 */
+/** 请求节流：保证相邻请求之间有最小间隔（间隔随失败自适应放宽） */
 async function fjpitPace() {
-    const wait = FJPIT_REQ_GAP_MS - (Date.now() - FJPIT_LAST_REQ_AT);
+    const wait = FJPIT_CUR_GAP_MS - (Date.now() - FJPIT_LAST_REQ_AT);
     if (wait > 0) await fjpitDelay(wait);
     FJPIT_LAST_REQ_AT = Date.now();
 }
@@ -590,6 +547,12 @@ async function fjpitApiRequest(method, path, body, token) {
             return json.data;
         } catch (e) {
             lastErr = e;
+            // 自适应降速：出现失败说明很可能正在撞限流，把全局间隔翻倍
+            const oldGap = FJPIT_CUR_GAP_MS;
+            FJPIT_CUR_GAP_MS = Math.min(FJPIT_GAP_MAX_MS, FJPIT_CUR_GAP_MS * 2);
+            if (FJPIT_CUR_GAP_MS !== oldGap) {
+                console.warn('JS: 请求失败，请求间隔 ' + oldGap + 'ms → ' + FJPIT_CUR_GAP_MS + 'ms');
+            }
             if (attempt < FJPIT_MAX_ATTEMPT) {
                 const back = FJPIT_RETRY_BASE_MS * attempt;
                 console.warn('JS: ' + path + ' 第 ' + attempt + ' 次失败（' + e.message
@@ -610,12 +573,42 @@ async function fjpitApiPost(path, body, token) {
 }
 
 /**
+ * 限并发遍历：最多同时执行 limit 个 worker，结果按原顺序返回。
+ * 用于把逐周抓取从「串行 N 次」压成「并发若干批」，把总耗时压进 3 秒。
+ */
+async function fjpitForEachLimit(items, limit, worker) {
+    const results = new Array(items.length);
+    let next = 0;
+    const n = Math.max(1, Math.min(limit | 0, items.length));
+    async function runner() {
+        for (;;) {
+            const i = next;
+            next++;
+            if (i >= items.length) return;
+            results[i] = await worker(items[i], i);
+        }
+    }
+    const runners = [];
+    for (let k = 0; k < n; k++) runners.push(runner());
+    await Promise.all(runners);
+    return results;
+}
+
+/**
  * 走结构化 API 取全部数据。
- * 任一步失败直接抛错，由调用方回退 HTML 通道。
- * 返回 { entries, timeSlots, semesterStartDate, totalWeeks, meta }
+ * 并发取数，目标 3 秒内完成：
+ *   · /semesters 必须先跑（后面依赖它返回的 semester）
+ *   · /semesterConfig 与 /scheduleTime 互不依赖 → 并发
+ *   · 逐周 /schedule 共 N 次 → 限并发 FJPIT_WEEK_CONCURRENCY
+ *   · 每次发起前由 fjpitPace() 保证最小间隔，失败时自适应放宽
+ *
+ * 任一步失败直接抛错。
+ * 返回 { entries, timeSlots, semesterStartDate, totalWeeks, failedWeeks, elapsedMs, meta }
  */
 async function fjpitCollectData(token, bar) {
-    // 1) 学期列表
+    const t0 = Date.now();
+
+    // 1) 学期列表（必须最先，后续依赖它）
     bar.setStatus('读取学期列表…');
     const semData = await fjpitApiGet('/semesters', token);
     const semList = (semData && semData.semesters) || [];
@@ -627,77 +620,99 @@ async function fjpitCollectData(token, bar) {
     const showXxq = (cur.isCurrent && cur.isXxq) ? 1 : 0;
     console.log('JS[A]: 学期 ' + semester + '，showxxq=' + showXxq);
 
-    // 2) 学期配置（开学日期 + 总周数）
-    bar.setStatus('读取学期配置…');
-    const cfgData = await fjpitApiPost('/semesterConfig', { semester: semester }, token);
-    const sc = (cfgData && cfgData.semestersConfig) || cfgData || {};
+    // 2) 学期配置 + 作息时间（互不依赖 → 并发）
+    bar.setStatus('读取学期配置与作息…');
+    const pair = await Promise.all([
+        fjpitApiPost('/semesterConfig', { semester: semester }, token).then(
+            function (d) { return { ok: true, data: d }; },
+            function (e) { return { ok: false, error: e }; }),
+        fjpitApiPost('/scheduleTime', { dqz: 1 }, token).then(
+            function (d) { return { ok: true, data: d }; },
+            function (e) { return { ok: false, error: e }; })
+    ]);
+
+    if (!pair[0].ok) throw pair[0].error;           // 学期配置是关键，失败必须中断
+    const sc = (pair[0].data && pair[0].data.semestersConfig) || pair[0].data || {};
     const totalWeeks = Number(sc.totalWeeks) || 0;
     const startDate = fjpitAlignToMonday(sc.startDate);   // 教务给的不一定是周一
     if (!(totalWeeks >= 1)) throw new Error('/semesterConfig 未返回有效 totalWeeks');
     console.log('JS[A]: 开学 ' + startDate + '，共 ' + totalWeeks + ' 周');
 
-    // 3) 作息时间
-    bar.setStatus('读取作息时间…');
     let timeSlots = [];
-    try {
-        const stData = await fjpitApiPost('/scheduleTime', { dqz: 1 }, token);
-        const arr = Array.isArray(stData) ? stData : Object.values(stData || {});
-        timeSlots = arr.map(function (e) {
-            const num = Number(e && e.jcdm);
-            const st = String((e && e.jcskkssj) || '').slice(0, 5);
-            const et = String((e && e.jcskjssj) || '').slice(0, 5);
-            return { number: num, startTime: st, endTime: et };
-        }).filter(function (t) {
-            return t.number >= 1 && /^\d{1,2}:\d{2}$/.test(t.startTime) && /^\d{1,2}:\d{2}$/.test(t.endTime);
-        }).sort(function (a, b) { return a.number - b.number; });
-    } catch (e) {
-        console.warn('JS[A]: 作息读取失败（不影响课表）: ' + e.message);
+    if (pair[1].ok) {
+        try {
+            const arr = Array.isArray(pair[1].data) ? pair[1].data : Object.values(pair[1].data || {});
+            timeSlots = arr.map(function (e) {
+                const num = Number(e && e.jcdm);
+                const st = String((e && e.jcskkssj) || '').slice(0, 5);
+                const et = String((e && e.jcskjssj) || '').slice(0, 5);
+                return { number: num, startTime: st, endTime: et };
+            }).filter(function (t) {
+                return t.number >= 1 && /^\d{1,2}:\d{2}$/.test(t.startTime) && /^\d{1,2}:\d{2}$/.test(t.endTime);
+            }).sort(function (a, b) { return a.number - b.number; });
+        } catch (e) {
+            console.warn('JS[A]: 作息解析失败（不影响课表）: ' + e.message);
+        }
+    } else {
+        console.warn('JS[A]: 作息读取失败（不影响课表）: ' + pair[1].error.message);
     }
 
-    // 4) 逐周课表
-    const entries = [];
-    const failedWeeks = [];
-    for (let w = 1; w <= totalWeeks; w++) {
-        bar.setStatus('抓取第 ' + w + '/' + totalWeeks + ' 周…');
-        let list = [];
+    // 3) 逐周课表（限并发；单周失败只记账不中断）
+    bar.setStatus('抓取周课表…');
+    const weekNums = [];
+    for (let w = 1; w <= totalWeeks; w++) weekNums.push(w);
+
+    let done = 0;
+    const results = await fjpitForEachLimit(weekNums, FJPIT_WEEK_CONCURRENCY, async function (w) {
         try {
             const d = await fjpitApiPost('/schedule',
                 { semester: semester, week: w, showxxq: showXxq }, token);
-            list = (d && d.list) || [];
+            return { week: w, list: (d && d.list) || [], ok: true };
         } catch (e) {
-            // 单周失败不中断整个流程（节流与退避重试已在 fjpitApiRequest 内做过），
-            // 记下失败周次继续抓后面的，最后在汇总里一并报出。
             console.warn('JS: 第 ' + w + ' 周抓取失败: ' + e.message);
-            failedWeeks.push(w);
-            continue;
+            return { week: w, list: [], ok: false };
+        } finally {
+            done++;
+            bar.setStatus('抓取周课表 ' + done + '/' + totalWeeks + '…');
         }
-        for (let i = 0; i < list.length; i++) {
-            const r = list[i];
-            if (!r) continue;
-            const name = String(r.course == null ? '' : r.course).trim();
-            const day = Number(r.DayIndex);
-            const start = Number(r.startNode);
-            const end = Number(r.endNode);
+    });
+
+    const entries = [];
+    const failedWeeks = [];
+    results.forEach(function (r) {
+        if (!r.ok) { failedWeeks.push(r.week); return; }
+        for (let i = 0; i < r.list.length; i++) {
+            const rec = r.list[i];
+            if (!rec) continue;
+            const name = String(rec.course == null ? '' : rec.course).trim();
+            const day = Number(rec.DayIndex);
+            const start = Number(rec.startNode);
+            const end = Number(rec.endNode);
             if (!name || !(day >= 1 && day <= 7) || !(start >= 1) || !(end >= start)) continue;
             entries.push({
-                week: w, day: day, date: '',
+                week: r.week, day: day, date: '',
                 start: start, end: end,
                 name: name,
-                teacher: r.teacherName == null ? '' : String(r.teacherName).trim(),
-                room: r.spaceName == null ? '' : String(r.spaceName).trim()
+                teacher: rec.teacherName == null ? '' : String(rec.teacherName).trim(),
+                room: rec.spaceName == null ? '' : String(rec.spaceName).trim()
             });
         }
-    }
+    });
 
     if (failedWeeks.length > Math.floor(totalWeeks / 2)) {
         throw new Error('过半周次抓取失败（' + failedWeeks.length + '/' + totalWeeks + '）：'
             + failedWeeks.join(','));
     }
 
+    const elapsedMs = Date.now() - t0;
+    console.log('JS[A]: 取数完成，用时 ' + elapsedMs + 'ms；失败周次 ' + failedWeeks.length
+        + '；最终请求间隔 ' + FJPIT_CUR_GAP_MS + 'ms');
+
     return {
         entries: entries, timeSlots: timeSlots,
         semesterStartDate: startDate, totalWeeks: totalWeeks,
         failedWeeks: failedWeeks,
+        elapsedMs: elapsedMs,
         meta: { semester: semester }
     };
 }
@@ -807,17 +822,6 @@ async function fjpitAskStart() {
     }
 }
 
-/** 第 3 步：触发页面自身的内部刷新（不整页重载，保住本次注入的修复） */
-async function fjpitRefreshPageData(bar) {
-    if (!FJPIT_REFRESH_BEFORE_IMPORT) return '';
-    bar.setStatus('刷新页面数据…');
-    const how = await fjpitRefreshInPage();
-    FJPIT_REFRESH_HOW = how;
-    if (how) console.log('JS: 已触发页面内部刷新（' + how + '）');
-    else console.log('JS: 未找到页面内的刷新按钮，跳过（不影响取数）');
-    return how;
-}
-
 /** 第 2 步：确保已登录；未登录则弹公告引导用户登录并等待 */
 async function fjpitEnsureLogin(bar) {
     let token = fjpitGetAccessToken();
@@ -826,27 +830,10 @@ async function fjpitEnsureLogin(bar) {
         return token;
     }
 
-    // 取不到 token 有两种情况，处理方式完全不同：
-    //   A. 确实没登录过 —— 页面会有登录表单 → 走下面的「请登录」引导
-    //   B. 本机有登录记录、但页面没就绪
-    //      （页面加载那一刻脚本还没注入，SPA 用被污染的通道请求会被拦）
-    //      → 触发一次【页面内部刷新】（不是整页重载），然后重新取 token
+    // 取不到 token ⇒ 走「请登录」引导，等用户登录后自动继续。
+    // （诊断信息仍打一份到日志；App 内看不到控制台，排查以汇总弹窗为准）
     const st = fjpitPageState();
     console.log('JS: 未取到 token。页面状态=' + JSON.stringify(st));
-
-    // 本机有登录记录、但页面没把 token 交出来 ⇒ 先触发「页面内部刷新」。
-    // 不用 location.reload()：那会连同本次注入的修复一起丢掉，
-    // 而 App 的 JS 补丁每次加载都会注入 ⇒ 重载后又被污染，等于白刷。
-    if (st.hasLocalCredential && !st.hasLoginForm) {
-        const how = await fjpitRefreshInPage();
-        console.log('JS: 页面未就绪，内部刷新方式=' + (how || '未找到刷新按钮'));
-        await fjpitDelay(900);
-        const t2 = fjpitGetAccessToken();
-        if (t2) {
-            console.log('JS: 内部刷新后取到 token，来源 ' + FJPIT_TOKEN_FROM);
-            return t2;
-        }
-    }
 
     bar.needLogin();
     token = await fjpitWaitForLogin(bar, Date.now() + FJPIT_LOGIN_WAIT_MS);
@@ -919,7 +906,7 @@ async function fjpitReport(data, saved) {
     const summary = [
         '导入完成',
         '登录令牌：' + (FJPIT_TOKEN_FROM || '未知'),
-        '页面内刷新：' + (FJPIT_REFRESH_HOW === 'button' ? '已点击刷新按钮' : '未找到刷新按钮'),
+        '取数耗时：' + (data.elapsedMs ? ((data.elapsedMs / 1000).toFixed(1) + 's') : '未知'),
         '课程行数：' + courses.length + '（' + nameCount + ' 门课）',
         '原始条目：' + data.entries.length + ' 条',
         '学期周数：' + data.totalWeeks,
@@ -969,11 +956,6 @@ async function runImportFlow() {
         fjpitSafeToast('已取消导入。');
         return;
     }
-
-    // 2.5 让页面自身重新取一次数据（页面内部刷新，不整页重载）
-    //     用户实测：本机保留登录态时，页面加载那会儿的请求已被拦下，
-    //     这里先让页面自己刷新一遍，再开始取数。
-    await fjpitRefreshPageData(bar);
 
     // 3. 取数（全部走教务接口，不解析页面 HTML）
     let data;
