@@ -69,18 +69,18 @@
 // ------------------------------------------------------------
 // ★ 本机保留登录态时的特殊情况（2026-09-18 用户实测）
 // ------------------------------------------------------------
-// 如果本机之前登录过，localStorage 会留下凭证
-// （key = fjpit-vben-auth-core-access），但【页面加载那一刻脚本还没注入】，
-// SPA 用被 App 补丁污染的通道去请求会失败，可能导致初始化异常、
-// 没把 token 解密放进 Pinia —— 于是点「执行导入」时取不到 token。
+// 本机之前登录过时，localStorage 会留下凭证
+// （key = fjpit-vben-auth-core-access）。但【页面加载那一刻脚本还没注入】，
+// SPA 用被 App 补丁污染的通道去请求会被拦下，页面自身的数据因此没取到。
 //
-// 处理：
-//   · 取不到 token 时先看「页面就绪度」（有无登录表单、localStorage 有无凭证）
-//   · 若「有凭证 + 无登录表单」⇒ 判定为页面未就绪 ⇒ 刷新页面一次，
-//     并提示用户刷新完成后重新点「执行导入」
-//   · token 另存一份到 sessionStorage（跨页面刷新保留）：
-//     这样即使刷新后页面仍未就绪，也能直接用备份 token 调接口
-//     —— 取数本来就不依赖页面状态，只依赖 token
+// 处理两条，互不冲突：
+//   · 【页面内部刷新】已登录时，取数前先触发一次页面自身的刷新
+//     （找到页面上的刷新按钮并点击），让页面重新取一遍数据。
+//     ⚠ 必须用「页面内部刷新」，**绝不能用 location.reload()**：
+//        整页重载会连同本次注入的修复一起丢掉，而 App 的 JS 补丁
+//        每次页面加载都会注入 ⇒ 重载后页面又回到被污染状态，等于白刷。
+//   · 【token 两级兜底】Pinia 取不到 token 时，改用 sessionStorage 备份
+//     （跨页面刷新保留）—— 因为取数只依赖 token，不依赖页面状态。
 // ------------------------------------------------------------
 
 // 数据规则（沿用已验证结论）：
@@ -387,7 +387,8 @@ function fjpitBuildControlBar(initialZoom) {
 
 /** 会话内 token 备份（sessionStorage 在页面重载后仍保留） */
 const FJPIT_TOKEN_BACKUP_KEY = 'fjpit-token-backup';
-const FJPIT_RELOAD_FLAG_KEY = 'fjpit-reloaded';
+const FJPIT_REFRESH_BEFORE_IMPORT = true;   // 已登录时，取数前先触发一次页面内部刷新
+let FJPIT_REFRESH_HOW = '';                 // 本次内部刷新的结果（'button' / ''），供汇总显示
 
 function fjpitSs() {
     try { return window.sessionStorage || null; } catch (e) { return null; }
@@ -469,6 +470,62 @@ function fjpitPageState() {
         st.piniaStores = (pinia && pinia._s instanceof Map) ? pinia._s.size : 0;
     } catch (e) {}
     return st;
+}
+
+/**
+ * 找教务页面自带的「刷新」按钮。
+ * 只扫真正可点击的元素（button / a / role=button / i / svg），
+ * 用 title、aria-label、class、id 里的 refresh / reload / 刷新 关键字匹配。
+ */
+function fjpitFindRefreshButton() {
+    const nodes = document.querySelectorAll('button, a, [role="button"], i, svg');
+    for (let i = 0; i < nodes.length; i++) {
+        const el = nodes[i];
+        let cls = '';
+        try {
+            cls = (typeof el.className === 'string')
+                ? el.className
+                : ((el.className && el.className.baseVal) || '');
+        } catch (e) {}
+        const hint = [
+            (el.getAttribute && el.getAttribute('title')) || '',
+            (el.getAttribute && el.getAttribute('aria-label')) || '',
+            (el.getAttribute && el.getAttribute('data-icon')) || '',
+            cls, el.id || ''
+        ].join(' ').toLowerCase();
+        if (!hint) continue;
+        if (/refresh|reload|刷新/.test(hint)) return el;
+    }
+    return null;
+}
+
+/**
+ * 触发教务页面自身的「内部刷新」——**不整页重载**。
+ *
+ * 为什么不能用 location.reload()：适配脚本只在点「执行导入」时注入，
+ * 整页重载会让本次注入连同所有修复一起消失；而 App 的 JS 补丁是
+ * 每次页面加载都注入的 ⇒ 重载后页面又回到被污染的状态，等于白刷。
+ *
+ * 返回触发方式（'button' / ''），供日志与排查使用。
+ */
+async function fjpitRefreshInPage() {
+    try {
+        const btn = fjpitFindRefreshButton();
+        if (btn) {
+            let desc = '';
+            try {
+                desc = (btn.getAttribute && (btn.getAttribute('title') || btn.getAttribute('aria-label')))
+                    || btn.id || (btn.tagName || '').toLowerCase();
+            } catch (e) {}
+            btn.click();
+            console.log('JS: 内部刷新 → 已点击页面刷新按钮（' + desc + '）');
+            await fjpitDelay(1200);
+            return 'button';
+        }
+    } catch (e) {
+        console.warn('JS: 点击刷新按钮失败', e);
+    }
+    return '';
 }
 
 /** 通道 A（结构化 API）用的头 —— 与移动端 m.fjpit.com 一致 */
@@ -750,6 +807,17 @@ async function fjpitAskStart() {
     }
 }
 
+/** 第 3 步：触发页面自身的内部刷新（不整页重载，保住本次注入的修复） */
+async function fjpitRefreshPageData(bar) {
+    if (!FJPIT_REFRESH_BEFORE_IMPORT) return '';
+    bar.setStatus('刷新页面数据…');
+    const how = await fjpitRefreshInPage();
+    FJPIT_REFRESH_HOW = how;
+    if (how) console.log('JS: 已触发页面内部刷新（' + how + '）');
+    else console.log('JS: 未找到页面内的刷新按钮，跳过（不影响取数）');
+    return how;
+}
+
 /** 第 2 步：确保已登录；未登录则弹公告引导用户登录并等待 */
 async function fjpitEnsureLogin(bar) {
     let token = fjpitGetAccessToken();
@@ -761,28 +829,23 @@ async function fjpitEnsureLogin(bar) {
     // 取不到 token 有两种情况，处理方式完全不同：
     //   A. 确实没登录过 —— 页面会有登录表单 → 走下面的「请登录」引导
     //   B. 本机有登录记录、但页面没就绪
-    //      （页面加载那一刻脚本还没注入，SPA 用被污染的通道请求、初始化异常，
-    //        于是没把 localStorage 里的 token 解密放进 Pinia）
-    //      → 这种情况刷新一次页面，让 SPA 重新走一遍启动流程
+    //      （页面加载那一刻脚本还没注入，SPA 用被污染的通道请求会被拦）
+    //      → 触发一次【页面内部刷新】（不是整页重载），然后重新取 token
     const st = fjpitPageState();
-    const ss = fjpitSs();
-    let reloaded = false;
-    try { reloaded = !!(ss && ss.getItem(FJPIT_RELOAD_FLAG_KEY)); } catch (e) {}
+    console.log('JS: 未取到 token。页面状态=' + JSON.stringify(st));
 
-    console.log('JS: 未取到 token。页面状态=' + JSON.stringify(st) + '，本会话已刷新过=' + reloaded);
-
-    if (st.hasLocalCredential && !st.hasLoginForm && !reloaded) {
-        try { if (ss) ss.setItem(FJPIT_RELOAD_FLAG_KEY, '1'); } catch (e) {}
-        try {
-            await window.shiguangBridgePromise.showAlert(
-                '页面需要重新加载',
-                '检测到本机有登录记录，但页面没有就绪 —— 很可能是页面加载时的请求被拦截，'
-                + '导致登录状态没有恢复。\n\n'
-                + '点「刷新」后页面会重新加载；加载完成后，请再点一次「执行导入」。',
-                '刷新');
-        } catch (e) {}
-        try { location.reload(); } catch (e) { location.href = location.href; }
-        return null;
+    // 本机有登录记录、但页面没把 token 交出来 ⇒ 先触发「页面内部刷新」。
+    // 不用 location.reload()：那会连同本次注入的修复一起丢掉，
+    // 而 App 的 JS 补丁每次加载都会注入 ⇒ 重载后又被污染，等于白刷。
+    if (st.hasLocalCredential && !st.hasLoginForm) {
+        const how = await fjpitRefreshInPage();
+        console.log('JS: 页面未就绪，内部刷新方式=' + (how || '未找到刷新按钮'));
+        await fjpitDelay(900);
+        const t2 = fjpitGetAccessToken();
+        if (t2) {
+            console.log('JS: 内部刷新后取到 token，来源 ' + FJPIT_TOKEN_FROM);
+            return t2;
+        }
     }
 
     bar.needLogin();
@@ -856,6 +919,7 @@ async function fjpitReport(data, saved) {
     const summary = [
         '导入完成',
         '登录令牌：' + (FJPIT_TOKEN_FROM || '未知'),
+        '页面内刷新：' + (FJPIT_REFRESH_HOW === 'button' ? '已点击刷新按钮' : '未找到刷新按钮'),
         '课程行数：' + courses.length + '（' + nameCount + ' 门课）',
         '原始条目：' + data.entries.length + ' 条',
         '学期周数：' + data.totalWeeks,
@@ -905,6 +969,11 @@ async function runImportFlow() {
         fjpitSafeToast('已取消导入。');
         return;
     }
+
+    // 2.5 让页面自身重新取一次数据（页面内部刷新，不整页重载）
+    //     用户实测：本机保留登录态时，页面加载那会儿的请求已被拦下，
+    //     这里先让页面自己刷新一遍，再开始取数。
+    await fjpitRefreshPageData(bar);
 
     // 3. 取数（全部走教务接口，不解析页面 HTML）
     let data;
