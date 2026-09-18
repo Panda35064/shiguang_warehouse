@@ -1,9 +1,9 @@
 # resources/FJPIT/adapters.yaml
 adapters:
   - adapter_id: "FJPIT_01"
-    adapter_name: "福建信息职业技术学院教务适配"
+    adapter_name: "福建信息职业技术学院"
     category: "BACHELOR_AND_ASSOCIATE"
     asset_js_path: "fjpit_01.js"
     import_url: "https://jw.fjpit.com/#/auth/login"
     maintainer: "Panda35064"
-    description: "适配福建信息职业技术学院智慧教务（Vben Admin / 超星）。直接读取教务接口的结构化课表数据（不解析页面 HTML），逐周抓取本学期全部周课表，并自动导入开学日期与 14 节作息时间。打开教务页后点击「执行导入」即可。※ 首次使用或登录过期时按提示登录一次，登录状态会保留，之后直接点「执行导入」；若登录后页面显示不出内容，不影响导入，直接点「执行导入」即可。"
+    description: "登录前需直接点击导入按钮！！！（学校防火墙限制），后续会弹窗引导。龙腰校区实测可用，如有问题请提issues"
