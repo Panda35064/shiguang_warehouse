@@ -1,18 +1,8 @@
-/**
- * 福建信息职业技术学院（福信智慧教务）课表导入适配脚本
- *
- * 教务前端 https://jw.fjpit.com   教务接口 https://jw-api.fjpit.com/api
- * 鉴权头 ba-token + server: 1；取数直接请求接口，不解析页面 HTML。
- *
- * 两个坑：
- * 1. App 的 JS 补丁给带字符串 body 的非 GET 请求自动加 X-WebView-Post-Id 头，
- *    教务 WAF 直接拒绝带该头的请求（连页面自身的登录 POST 也中招）。故须先把
- *    页面网络通道修干净才能登录 ⇒ 首次先点「执行导入」再登录，之后登录态保留。
- * 2. WAF 有短时速率限制，连续快速请求会被成片拒绝 ⇒ 逐周抓取带节流与退避重试。
- *
- * 数据规则：教师/教室按原文原样保留（空即空，不填「无」）；逐周抓 1~N 周，
- *           不用学期计划视图（军训不整周、调课、节假日）。
- */
+// 福建信息职业技术学院（福信智慧教务）课表导入适配脚本
+// 前端 jw.fjpit.com · 接口 jw-api.fjpit.com/api · 鉴权头 ba-token + server: 1
+// 取数直接请求接口，不解析页面 HTML；教师/教室按原文原样保留（空即空）
+// 注意：App 会给非 GET 请求加 X-WebView-Post-Id，教务 WAF 直接拒绝，须先点「执行导入」再登录
+
 
 const FJPIT_API = 'https://jw-api.fjpit.com/api';
 const FJPIT_HOST_KEY = 'fjpit.com';
@@ -86,6 +76,7 @@ function fjpitFetch(url, init) {
     return fjpitCleanFetch()(url, init);
 }
 
+/** 修好页面请求通道：丢掉 App 补丁加的 X-WebView-Post-Id，否则教务 WAF 会拒掉一切 POST */
 function fjpitRepairPageNetwork() {
     const report = { fetch: false, xhr: false };
 
@@ -368,9 +359,8 @@ function fjpitApiHeaders(token) {
 
 // ---------- 四、取数（结构化 API） ----------
 
-// 请求节奏与重试：教务 WAF 有短时速率限制（实测连续请求会成片被拒，
-// 失败耗时仅 70~90ms 即「被立即拒绝」，过一段时间自动恢复），故请求间加间隔、
-// 失败退避重试；一旦失败就把间隔翻倍自适应降速，宁可慢也要把数据取全。
+// 教务 WAF 有短时速率限制（连续快速请求会被成片拒绝），故加请求间隔 + 失败退避重试
+// 一旦出现失败就把全局间隔翻倍（上限 800ms）自适应降速，宁可慢也要把数据取全
 const FJPIT_REQ_GAP_MS = 90;        // 相邻请求最小间隔（起始值）
 const FJPIT_GAP_MAX_MS = 800;       // 自适应间隔上限
 const FJPIT_MAX_ATTEMPT = 3;        // 单个请求最多尝试次数
