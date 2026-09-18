@@ -131,11 +131,8 @@ function fjpitBuildStatusBar() {
 
 // ---------- 三、鉴权 ----------
 
-/** token 实际来源，便于排查（'pinia' / ''） */
-let FJPIT_TOKEN_FROM = '';
-
-/** 从 Pinia store 取 accessToken（正常路径） */
-function fjpitTokenFromPinia() {
+/** 从 Pinia store 取 accessToken；取不到返回 null，由调用方走「请登录」引导 */
+function fjpitGetAccessToken() {
     const root = document.querySelector('#app') || document.body.firstElementChild;
     const app = root && root.__vue_app__;
     const gp = app && app.config && app.config.globalProperties;
@@ -150,13 +147,6 @@ function fjpitTokenFromPinia() {
         }
     }
     return fallback;
-}
-
-/** 取 accessToken；取不到返回 null，由调用方走「请登录」引导 */
-function fjpitGetAccessToken() {
-    const t = fjpitTokenFromPinia();
-    FJPIT_TOKEN_FROM = t ? 'pinia' : '';
-    return t || null;
 }
 
 /** 结构化接口用的头 —— 与移动端 m.fjpit.com 一致 */
@@ -447,15 +437,11 @@ async function fjpitAskStart() {
 /** 第 2 步：确保已登录；未登录则弹公告引导用户登录并等待 */
 async function fjpitEnsureLogin(bar) {
     let token = fjpitGetAccessToken();
-    if (token) {
-        console.log('JS: token 来源：' + FJPIT_TOKEN_FROM);
-        return token;
-    }
+    if (token) return token;
 
     bar.needLogin();
     token = await fjpitWaitForLogin(bar, Date.now() + FJPIT_LOGIN_WAIT_MS);
     if (!token) token = fjpitGetAccessToken();   // 兜底：前端可能刚把 token 写进 store
-    if (token) console.log('JS: token 来源：' + FJPIT_TOKEN_FROM);
     return token;
 }
 
@@ -482,28 +468,20 @@ async function fjpitSaveAll(data) {
     return { courses: courses, timeSlotSaved: timeSlotSaved };
 }
 
-/** 第 5 步：汇总公告（App 内看不到控制台，排查靠这个弹窗） */
+/** 第 5 步：汇总公告 */
 async function fjpitReport(data, saved) {
     const courses = saved.courses;
 
     const nameSet = {};
-    let emptyPos = 0, emptyTea = 0;
-    courses.forEach(function (c) {
-        nameSet[c.name] = 1;
-        if (!c.position) emptyPos++;
-        if (!c.teacher) emptyTea++;
-    });
+    courses.forEach(function (c) { nameSet[c.name] = 1; });
 
     const summary = [
         '导入完成',
-        '登录令牌：' + (FJPIT_TOKEN_FROM || '未知'),
-        '取数耗时：' + (data.elapsedMs ? ((data.elapsedMs / 1000).toFixed(1) + 's') : '未知'),
         '课程行数：' + courses.length + '（' + Object.keys(nameSet).length + ' 门课）',
-        '原始条目：' + data.entries.length + ' 条',
         '学期周数：' + data.totalWeeks,
         '开学日期：' + (data.semesterStartDate || '未取到'),
         '作息时间：' + (saved.timeSlotSaved ? (data.timeSlots || []).length + ' 节' : '未导入'),
-        '空教师 ' + emptyTea + ' 行 / 空教室 ' + emptyPos + ' 行',
+        '取数耗时：' + (data.elapsedMs ? ((data.elapsedMs / 1000).toFixed(1) + 's') : '未知'),
         (data.failedWeeks && data.failedWeeks.length)
             ? '失败周次：' + data.failedWeeks.join(',') : '全部周次抓取成功'
     ];
