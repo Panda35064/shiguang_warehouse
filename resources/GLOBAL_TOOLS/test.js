@@ -89,48 +89,7 @@ function fjpitRepairPageNetwork() {
     return report;
 }
 
-// ---------- 二、状态条 ----------
-
-/** 底部状态条：显示进度与等待提示；登录引导走 App 原生弹窗 */
-function fjpitBuildStatusBar() {
-    const root = document.createElement('div');
-    root.setAttribute('data-fjpit-ui', '1');
-    root.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147483647;'
-        + 'box-sizing:border-box;padding:10px 12px;pointer-events:none;overflow:hidden;'
-        + 'background:rgba(17,20,26,.94);color:#fff;font-size:13px;line-height:1.5;'
-        + 'text-overflow:ellipsis;white-space:nowrap;'
-        + 'font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif';
-    root.textContent = '准备中…';
-    (document.body || document.head || document.documentElement).appendChild(root);
-
-    return {
-        /** 弹原生弹窗提示用户登录；点掉弹窗后 resolve */
-        needLogin: function () {
-            root.textContent = '等待登录…';
-            try {
-                return window.shiguangBridgePromise.showAlert(
-                    '第 1 步：登录教务',
-                    '福信教务的防火墙会拦下未加工过的登录请求，'
-                    + '所以需要你先点一下本工具，把请求通道理通。\n\n'
-                    + '点「去登录」关闭本提示后，请在页面中登录你的教务账号；'
-                    + '登录成功会自动开始导入课表，不需要再点任何按钮。\n\n'
-                    + '※ 只有首次使用或登录过期时才需要这一步，'
-                    + '之后直接点「执行导入」即可。',
-                    '去登录'
-                );
-            } catch (e) {
-                console.warn('JS: 弹窗失败', e);
-                return Promise.resolve(true);
-            }
-        },
-        setStatus: function (t) { root.textContent = t; },
-        destroy: function () {
-            try { if (root.parentNode) root.parentNode.removeChild(root); } catch (e) { }
-        }
-    };
-}
-
-// ---------- 三、鉴权 ----------
+// ---------- 二、鉴权 ----------
 
 /** 从 Pinia store 取 accessToken；取不到返回 null，由调用方走「请登录」引导 */
 function fjpitGetAccessToken() {
@@ -163,7 +122,7 @@ function fjpitApiHeaders(token) {
     return h;
 }
 
-// ---------- 四、取数（结构化 API） ----------
+// ---------- 三、取数（结构化 API） ----------
 
 // 教务 WAF 有短时速率限制（连续快速请求会被成片拒绝），故加请求间隔 + 失败退避重试
 // 一旦出现失败就把全局间隔翻倍（上限 800ms）自适应降速，宁可慢也要把数据取全
@@ -293,11 +252,10 @@ function fjpitParseEntry(rec, week, nodeMap) {
 
 /** 走教务接口取全部数据，任一步失败直接抛错。
  *  并发编排：/semesters 串行 → 配置 + 作息并发 → 逐周限并发 FJPIT_WEEK_CONCURRENCY */
-async function fjpitCollectData(token, bar) {
+async function fjpitCollectData(token) {
     const t0 = Date.now();
 
     // 1) 学期列表（必须最先，后续依赖它）
-    bar.setStatus('读取学期列表…');
     const semData = await fjpitApiGet('/semesters', token);
     const semList = (semData && semData.semesters) || [];
     if (!semList.length) throw new Error('/semesters 无学期数据');
@@ -306,7 +264,6 @@ async function fjpitCollectData(token, bar) {
     const showXxq = (cur.isCurrent && cur.isXxq) ? 1 : 0;
 
     // 2) 学期配置（关键，失败即中断）与作息（非关键）并发
-    bar.setStatus('读取学期配置与作息…');
     const slotPromise = fjpitApiPost('/scheduleTime', { dqz: 1 }, token).catch(function (e) {
         console.warn('JS: 作息读取失败（不影响课表）: ' + e.message);
         return null;
@@ -320,11 +277,9 @@ async function fjpitCollectData(token, bar) {
     console.log('JS: 作息 ' + ts.slots.length + ' 节（剔除休息行 ' + ts.dropped + '）');
 
     // 3) 逐周课表（限并发；单周失败只记账不中断）
-    bar.setStatus('抓取周课表…');
     const weeks = [];
     for (let w = 1; w <= totalWeeks; w++) weeks.push(w);
 
-    let done = 0;
     const results = await fjpitForEachLimit(weeks, FJPIT_WEEK_CONCURRENCY, async function (w) {
         try {
             const d = await fjpitApiPost('/schedule',
@@ -333,8 +288,6 @@ async function fjpitCollectData(token, bar) {
         } catch (e) {
             console.warn('JS: 第 ' + w + ' 周抓取失败: ' + e.message);
             return { week: w, list: [], ok: false };
-        } finally {
-            bar.setStatus('抓取周课表 ' + (++done) + '/' + totalWeeks + '…');
         }
     });
 
@@ -364,7 +317,7 @@ async function fjpitCollectData(token, bar) {
     };
 }
 
-// ---------- 五、聚合（教师/教室原样透传） ----------
+// ---------- 四、聚合（教师/教室原样透传） ----------
 
 function fjpitAggregate(entries) {
     const SEP = '\u0001';
@@ -393,7 +346,7 @@ function fjpitAggregate(entries) {
     return list;
 }
 
-// ---------- 六、保存 ----------
+// ---------- 五、保存 ----------
 
 async function fjpitSaveCourses(courses) {
     await window.shiguangBridgePromise.saveImportedCourses(JSON.stringify(courses, null, 2));
@@ -415,52 +368,36 @@ async function fjpitSaveConfig(semesterStartDate, totalWeeks) {
     await window.shiguangBridgePromise.saveCourseConfig(JSON.stringify(config));
 }
 
-// ---------- 七、等待登录 ----------
+// ---------- 六、等待登录 ----------
 
 /** 轮询等待用户登录；页面被整页重载则提前返回 null */
-async function fjpitWaitForLogin(bar, deadlineTs) {
+async function fjpitWaitForLogin(deadlineTs) {
     const bodyRef = document.body;
     let lastTip = 0;
     while (Date.now() < deadlineTs) {
         if (document.body !== bodyRef) return null;
         const token = fjpitGetAccessToken();
         if (token) return token;
-        if (Date.now() - lastTip > 900) {
+        if (Date.now() - lastTip > 60000) {      // 每分钟用原生 toast 提醒一次
             lastTip = Date.now();
-            bar.setStatus('等待登录（' + Math.ceil((deadlineTs - Date.now()) / 1000) + 's）… 登录后会自动继续');
+            fjpitSafeToast('请在页面中登录教务账号，登录后会自动继续导入');
         }
         await fjpitDelay(700);
     }
     return null;
 }
 
-// ---------- 八、主流程（编排） ----------
+// ---------- 七、主流程（编排） ----------
 // 按官方推荐的编排模式：只做顺序编排；任一步失败立即 return；
 // notifyTaskCompletion() 只在完全成功后调用。
 
-/** 第 1 步：公告式确认 */
-async function fjpitAskStart() {
-    try {
-        return await window.shiguangBridgePromise.showAlert(
-            '福信智慧教务课表导入',
-            '本工具将逐周抓取本学期全部周课表，并自动导入开学日期与作息时间。\n\n'
-            + '数据直接读取教务接口，不解析页面，通常几秒完成。\n'
-            + '请勿中途离开页面。',
-            '开始导入'
-        );
-    } catch (e) {
-        console.warn('JS: 确认弹窗失败', e);
-        return false;
-    }
-}
-
-/** 第 2 步：确保已登录；未登录则弹公告引导用户登录并等待 */
-async function fjpitEnsureLogin(bar) {
+/** 确保已登录；未登录则用原生 toast 提示并等待 */
+async function fjpitEnsureLogin() {
     let token = fjpitGetAccessToken();
     if (token) return token;
 
-    bar.needLogin();
-    token = await fjpitWaitForLogin(bar, Date.now() + FJPIT_LOGIN_WAIT_MS);
+    fjpitSafeToast('未检测到登录状态，请在页面中登录教务账号');
+    token = await fjpitWaitForLogin(Date.now() + FJPIT_LOGIN_WAIT_MS);
     if (!token) token = fjpitGetAccessToken();   // 兜底：前端可能刚把 token 写进 store
     return token;
 }
@@ -521,61 +458,39 @@ async function runImportFlow() {
         return;
     }
     console.log('JS: 页面网络通道修复 ' + JSON.stringify(fjpitRepairPageNetwork()));
-    const bar = fjpitBuildStatusBar();
-
-    // 1. 登录（未登录则弹公告引导 + 等待）
-    const token = await fjpitEnsureLogin(bar);
+    // 1. 登录（未登录则提示 + 等待）
+    const token = await fjpitEnsureLogin();
     if (!token) {
-        bar.destroy();
         fjpitSafeToast('未等到登录状态，请登录后重新点「执行导入」。');
         return;
     }
-    bar.setStatus('已登录，准备导入…');
 
-    // 2. 确认
-    if (!await fjpitAskStart()) {
-        bar.destroy();
-        fjpitSafeToast('已取消导入。');
-        return;
-    }
-
-    // 3. 取数（全部走教务接口，不解析页面 HTML）
+    // 2. 取数（全部走教务接口，不解析页面 HTML）
     let data;
     try {
-        data = await fjpitCollectData(token, bar);
+        data = await fjpitCollectData(token);
     } catch (e) {
-        bar.destroy();
-        fjpitSafeToast('取数失败：' + e.message);
-        await window.shiguangBridgePromise.showAlert(
-            '取数失败',
-            '未能取到课表数据：\n' + e.message
-            + '\n\n请确认已登录教务系统后重试。',
-            '知道了'
-        );
+        fjpitSafeToast('取数失败，请确认已登录教务系统后重试：' + e.message);
         return;
     }
     if (!data.entries.length) {
-        bar.destroy();
         fjpitSafeToast('未取到任何课程，请确认本学期是否有排课。');
         return;
     }
 
-    // 4. 聚合 + 保存
-    bar.setStatus('保存课程…');
+    // 3. 聚合 + 保存
     let saved;
     try {
         saved = await fjpitSaveAll(data);
     } catch (e) {
-        bar.destroy();
         fjpitSafeToast('课程保存失败：' + e.message);
         return;
     }
 
-    // 5. 汇总
-    bar.destroy();
+    // 4. 汇总
     await fjpitReport(data, saved);
 
-    // 6. 完全成功，才发结束信号
+    // 5. 完全成功，才发结束信号
     window.shiguangBridge.notifyTaskCompletion();
 }
 
