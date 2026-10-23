@@ -1328,7 +1328,7 @@ schools:
     initial: "Z"
     resource_folder: "ZUST"
 
-  - id: "GZJD"
+  - id: "GZTCME"
     name: "贵州机电职业技术学院"
     initial: "G"
-    resource_folder: "GZJD"
+    resource_folder: "GZTCME"

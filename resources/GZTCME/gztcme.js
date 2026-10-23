@@ -1,21 +1,21 @@
 // 贵州机电职业技术学院（gztcme.cn）正方 V9 教务适配
 // 入口：登录后进入「个人课表查询」，再执行导入。
 
-function gzjdText(value) {
+function gztcmeText(value) {
     return String(value == null ? '' : value).replace(/^\s+|\s+$/g, '');
 }
 
-function gzjdConfirmed(value) {
+function gztcmeConfirmed(value) {
     return value === true || value === 'true';
 }
 
-function gzjdCheckPage() {
+function gztcmeCheckPage() {
     if (window.location.pathname.indexOf('/jwglxt/') < 0) {
         throw new Error('请先在教务系统（jwxt.gztcme.cn）登录并进入“个人课表查询”，再执行导入。');
     }
 }
 
-async function gzjdFetchText(path, body) {
+async function gztcmeFetchText(path, body) {
     const init = { method: body ? 'POST' : 'GET', credentials: 'include' };
     if (body) {
         init.headers = { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' };
@@ -35,8 +35,8 @@ async function gzjdFetchText(path, body) {
     return text;
 }
 
-async function gzjdFetchJson(path, body) {
-    const text = await gzjdFetchText(path, body);
+async function gztcmeFetchJson(path, body) {
+    const text = await gztcmeFetchText(path, body);
     try {
         return JSON.parse(text);
     } catch (error) {
@@ -44,22 +44,22 @@ async function gzjdFetchJson(path, body) {
     }
 }
 
-function gzjdOptions(doc, selector) {
+function gztcmeOptions(doc, selector) {
     const list = [];
     const nodes = doc.querySelectorAll(selector + ' option');
     for (let i = 0; i < nodes.length; i++) {
-        const value = gzjdText(nodes[i].getAttribute('value'));
+        const value = gztcmeText(nodes[i].getAttribute('value'));
         if (!value) continue;
         list.push({
             value: value,
-            label: gzjdText(nodes[i].textContent) || value,
+            label: gztcmeText(nodes[i].textContent) || value,
             selected: nodes[i].selected === true || nodes[i].hasAttribute('selected')
         });
     }
     return list;
 }
 
-async function gzjdPick(title, items, defaultIndex) {
+async function gztcmePick(title, items, defaultIndex) {
     const labels = [];
     for (let i = 0; i < items.length; i++) labels.push(items[i].label);
     const picked = await window.shiguangBridgePromise.showSingleSelection(title, JSON.stringify(labels), defaultIndex);
@@ -71,26 +71,26 @@ async function gzjdPick(title, items, defaultIndex) {
     return items[index];
 }
 
-async function gzjdChooseTerm() {
-    const html = await gzjdFetchText('kbcx/xskbcx_cxXskbcxIndex.html?gnmkdm=N2151&layout=default');
+async function gztcmeChooseTerm() {
+    const html = await gztcmeFetchText('kbcx/xskbcx_cxXskbcxIndex.html?gnmkdm=N2151&layout=default');
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    const years = gzjdOptions(doc, '#xnm');
-    const terms = gzjdOptions(doc, '#xqm');
+    const years = gztcmeOptions(doc, '#xnm');
+    const terms = gztcmeOptions(doc, '#xqm');
     if (years.length === 0 || terms.length === 0) throw new Error('未取得学年学期列表，请确认已经登录教务系统。');
 
     let yearIndex = 0, termIndex = 0;
     for (let i = 0; i < years.length; i++) if (years[i].selected) yearIndex = i;
     for (let i = 0; i < terms.length; i++) if (terms[i].selected) termIndex = i;
 
-    const year = await gzjdPick('选择学年', years, yearIndex);
+    const year = await gztcmePick('选择学年', years, yearIndex);
     if (!year) return null;
-    const term = await gzjdPick('选择学期', terms, termIndex);
+    const term = await gztcmePick('选择学期', terms, termIndex);
     if (!term) return null;
     return { year: year.value, term: term.value, label: year.label + ' 第 ' + term.label + ' 学期' };
 }
 
-function gzjdWeeks(value) {
-    const text = gzjdText(value).replace(/[第周\s]/g, '').replace(/（/g, '(').replace(/）/g, ')').replace(/[，、]/g, ',');
+function gztcmeWeeks(value) {
+    const text = gztcmeText(value).replace(/[第周\s]/g, '').replace(/（/g, '(').replace(/）/g, ')').replace(/[，、]/g, ',');
     const weeks = [], seen = {};
     const parts = text.split(',');
     for (let i = 0; i < parts.length; i++) {
@@ -110,47 +110,47 @@ function gzjdWeeks(value) {
     return weeks;
 }
 
-function gzjdCourses(data, term) {
+function gztcmeCourses(data, term) {
     if (!data || !Array.isArray(data.kbList) || !data.xsxx) throw new Error('教务未返回课表数据，请重新进入个人课表页面。');
-    if (gzjdText(data.xsxx.XNM) !== term.year || gzjdText(data.xsxx.XQM) !== term.term) {
+    if (gztcmeText(data.xsxx.XNM) !== term.year || gztcmeText(data.xsxx.XQM) !== term.term) {
         throw new Error('课表与所选学期不一致，请重新导入。');
     }
     const courses = [], campuses = [];
     for (let i = 0; i < data.kbList.length; i++) {
         const row = data.kbList[i];
-        const name = gzjdText(row.kcmc);
+        const name = gztcmeText(row.kcmc);
         if (!name) continue;
         const day = Number(row.xqj);
-        const section = gzjdText(row.jcs).replace(/节/g, '').match(/^(\d+)(?:-(\d+))?$/);
+        const section = gztcmeText(row.jcs).replace(/节/g, '').match(/^(\d+)(?:-(\d+))?$/);
         if (!(day >= 1 && day <= 7) || !section) throw new Error('课程「' + name + '」的星期或节次异常，请核对教务课表。');
         const startSection = Number(section[1]), endSection = Number(section[2] || section[1]);
         if (startSection < 1 || endSection < startSection) throw new Error('课程「' + name + '」的节次异常，请核对教务课表。');
         courses.push({
             name: name,
-            teacher: gzjdText(row.xm),
-            position: gzjdText(row.cdmc),
+            teacher: gztcmeText(row.xm),
+            position: gztcmeText(row.cdmc),
             day: day,
             startSection: startSection,
             endSection: endSection,
-            weeks: gzjdWeeks(row.zcd)
+            weeks: gztcmeWeeks(row.zcd)
         });
-        const campusId = gzjdText(row.xqh_id);
+        const campusId = gztcmeText(row.xqh_id);
         if (campusId) {
             let known = false;
             for (let j = 0; j < campuses.length; j++) if (campuses[j].value === campusId) known = true;
-            if (!known) campuses.push({ value: campusId, label: gzjdText(row.xqmc) || '校区' });
+            if (!known) campuses.push({ value: campusId, label: gztcmeText(row.xqmc) || '校区' });
         }
     }
     if (courses.length === 0) throw new Error('该学期没有可导入的课程，请确认所选学期。');
     return { courses: courses, campuses: campuses, unscheduled: Array.isArray(data.sjkList) ? data.sjkList : [] };
 }
 
-function gzjdCalendar(rows) {
+function gztcmeCalendar(rows) {
     if (!Array.isArray(rows) || rows.length === 0) throw new Error('未取得所选学期的校历，请确认学期选择。');
     const weeks = [];
     for (let i = 0; i < rows.length; i++) {
         const number = Number(rows[i].zs);
-        const match = gzjdText(rows[i].rq).match(/^(\d{4}-\d{2}-\d{2})\/(\d{4}-\d{2}-\d{2})$/);
+        const match = gztcmeText(rows[i].rq).match(/^(\d{4}-\d{2}-\d{2})\/(\d{4}-\d{2}-\d{2})$/);
         if (!(number >= 1) || !match) throw new Error('校历格式异常，无法确定开学日期。');
         weeks.push({ number: number, start: match[1], end: match[2] });
     }
@@ -169,19 +169,19 @@ function gzjdCalendar(rows) {
     return { semesterStartDate: weeks[0].start, semesterTotalWeeks: weeks.length, firstDayOfWeek: 1 };
 }
 
-function gzjdClock(value) {
-    const match = gzjdText(value).match(/^(\d{1,2}):(\d{2})/);
+function gztcmeClock(value) {
+    const match = gztcmeText(value).match(/^(\d{1,2}):(\d{2})/);
     if (!match) throw new Error('作息时间格式异常。');
     return (match[1].length === 1 ? '0' + match[1] : match[1]) + ':' + match[2];
 }
 
-function gzjdTimeSlots(rows) {
+function gztcmeTimeSlots(rows) {
     const slots = [], seen = {};
     for (let i = 0; i < rows.length; i++) {
         const number = Number(rows[i].jcmc);
         if (!(number >= 1) || seen[number]) continue;
         seen[number] = true;
-        slots.push({ number: number, startTime: gzjdClock(rows[i].qssj), endTime: gzjdClock(rows[i].jssj) });
+        slots.push({ number: number, startTime: gztcmeClock(rows[i].qssj), endTime: gztcmeClock(rows[i].jssj) });
     }
     slots.sort(function (a, b) { return a.number - b.number; });
     for (let i = 0; i < slots.length; i++) {
@@ -191,38 +191,38 @@ function gzjdTimeSlots(rows) {
     return slots;
 }
 
-async function gzjdSave(method, value, label) {
+async function gztcmeSave(method, value, label) {
     const result = await window.shiguangBridgePromise[method](JSON.stringify(value));
-    if (!gzjdConfirmed(result)) throw new Error(label + '保存未成功，请重新导入。');
+    if (!gztcmeConfirmed(result)) throw new Error(label + '保存未成功，请重新导入。');
 }
 
-async function gzjdRunImport() {
+async function gztcmeRunImport() {
     let savedStage = '';
     try {
-        gzjdCheckPage();
+        gztcmeCheckPage();
         window.shiguangBridge.showToast('正在读取学年学期…');
-        const term = await gzjdChooseTerm();
+        const term = await gztcmeChooseTerm();
         if (!term) { window.shiguangBridge.showToast('导入已取消'); return; }
 
         window.shiguangBridge.showToast('正在读取课表、校历和作息…');
         const fetched = await Promise.all([
-            gzjdFetchJson('kbcx/xskbcx_cxXsgrkb.html?gnmkdm=N2151', 'xnm=' + term.year + '&xqm=' + term.term + '&kzlx=ck'),
-            gzjdFetchJson('kbcx/xskbcxZccx_cxZcByXnxq.html?gnmkdm=N2154', 'xnm=' + term.year + '&xqm=' + term.term)
+            gztcmeFetchJson('kbcx/xskbcx_cxXsgrkb.html?gnmkdm=N2151', 'xnm=' + term.year + '&xqm=' + term.term + '&kzlx=ck'),
+            gztcmeFetchJson('kbcx/xskbcxZccx_cxZcByXnxq.html?gnmkdm=N2154', 'xnm=' + term.year + '&xqm=' + term.term)
         ]);
-        const parsed = gzjdCourses(fetched[0], term);
-        const config = gzjdCalendar(fetched[1]);
+        const parsed = gztcmeCourses(fetched[0], term);
+        const config = gztcmeCalendar(fetched[1]);
 
         let campus = parsed.campuses.length > 0 ? parsed.campuses[0] : null;
         if (parsed.campuses.length > 1) {
-            campus = await gzjdPick('选择课表作息校区', parsed.campuses, 0);
+            campus = await gztcmePick('选择课表作息校区', parsed.campuses, 0);
             if (!campus) { window.shiguangBridge.showToast('导入已取消'); return; }
         }
 
         let slots = [];
         if (campus) {
-            const rows = await gzjdFetchJson('kbcx/xskbcx_cxRjc.html?gnmkdm=N2151',
+            const rows = await gztcmeFetchJson('kbcx/xskbcx_cxRjc.html?gnmkdm=N2151',
                 'xnm=' + term.year + '&xqm=' + term.term + '&xqh_id=' + campus.value);
-            slots = gzjdTimeSlots(Array.isArray(rows) ? rows : []);
+            slots = gztcmeTimeSlots(Array.isArray(rows) ? rows : []);
         }
 
         let maxSection = 0;
@@ -250,21 +250,21 @@ async function gzjdRunImport() {
             let pending = '';
             for (let i = 0; i < parsed.unscheduled.length; i++) {
                 const row = parsed.unscheduled[i];
-                pending += '\n· ' + (gzjdText(row.kcmc) || '未命名课程') + '（' + (gzjdText(row.qsjsz) || '周次未知') + '）';
+                pending += '\n· ' + (gztcmeText(row.kcmc) || '未命名课程') + '（' + (gztcmeText(row.qsjsz) || '周次未知') + '）';
             }
             note += '\n\n以下 ' + parsed.unscheduled.length + ' 门课尚未排定上课时间，本次不导入：' + pending;
         }
 
         const confirmed = await window.shiguangBridgePromise.showAlert('核对导入信息', note, '确认导入');
-        if (!gzjdConfirmed(confirmed)) { window.shiguangBridge.showToast('导入已取消'); return; }
+        if (!gztcmeConfirmed(confirmed)) { window.shiguangBridge.showToast('导入已取消'); return; }
 
-        await gzjdSave('saveCourseConfig', config, '学期配置');
+        await gztcmeSave('saveCourseConfig', config, '学期配置');
         savedStage = '学期配置';
         if (slots.length > 0) {
-            await gzjdSave('savePresetTimeSlots', slots, '作息');
+            await gztcmeSave('savePresetTimeSlots', slots, '作息');
             savedStage = '学期配置和作息';
         }
-        await gzjdSave('saveImportedCourses', parsed.courses, '课程');
+        await gztcmeSave('saveImportedCourses', parsed.courses, '课程');
         window.shiguangBridge.showToast('已导入 ' + parsed.courses.length + ' 条课程时段');
         window.shiguangBridge.notifyTaskCompletion();
     } catch (error) {
@@ -274,4 +274,4 @@ async function gzjdRunImport() {
     }
 }
 
-gzjdRunImport();
+gztcmeRunImport();
