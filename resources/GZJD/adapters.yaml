@@ -1,0 +1,9 @@
+# resources/GZJD/adapters.yaml
+adapters:
+  - adapter_id: "GZJD"
+    adapter_name: "贵州机电职业技术学院"
+    category: "BACHELOR_AND_ASSOCIATE"
+    asset_js_path: "gzjd.js"
+    import_url: "https://jwxt.gztcme.cn/jwglxt/xtgl/login_slogin.html"
+    maintainer: "Panda君"
+    description: "正方教务，登录后进入“个人课表查询”再点击导入；可选择学年学期，自动读取校历、校区作息与周次，未排定时间的课程会提示。"
